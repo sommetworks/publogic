@@ -40,23 +40,22 @@
 
       <div class="analyser-card" id="upload-panel">
         <div class="analyser-header">
-          <h2>Monthly bulk analyser</h2>
-          <p>Upload all five daily report types for any number of days at once. PubLogic identifies each file automatically from the filename.</p>
+          <h2>Portfolio bulk analyser</h2>
+          <p>Drop Bepoz Time Break reports from any number of venues at once. PubLogic reads the Venue and Store fields inside each file to identify it — filenames don't matter, so a whole portfolio can be dropped in together and analysed venue by venue.</p>
         </div>
 
         <div class="report-types">
-          <div class="report-type"><span class="rt-dot"></span>CH Department Time Break</div>
-          <div class="report-type"><span class="rt-dot"></span>CH Food Time Break</div>
-          <div class="report-type"><span class="rt-dot"></span>CH Hotel Beverage Time Break</div>
-          <div class="report-type"><span class="rt-dot"></span>CH BShop Beverage Time Break</div>
-          <div class="report-type"><span class="rt-dot"></span>CH Smugglers Till Time Break</div>
+          <div class="report-type"><span class="rt-dot"></span>Food Time Break</div>
+          <div class="report-type"><span class="rt-dot"></span>Main Bar Beverage Time Break</div>
+          <div class="report-type"><span class="rt-dot"></span>Bottle Shop Time Break</div>
+          <div class="report-type"><span class="rt-dot"></span>Satellite bar Time Break</div>
         </div>
 
-        <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()" 
+        <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()"
              role="button" tabindex="0" aria-label="Upload Bepoz report files">
           <div class="drop-icon">↑</div>
           <div class="drop-title">Drop files here or click to upload</div>
-          <div class="drop-sub">PDF or Excel — spaces or underscores in filenames both accepted</div>
+          <div class="drop-sub">PDF or Excel, from one venue or several — report type is read from the file contents</div>
         </div>
         <input type="file" id="file-input" multiple accept=".pdf,.xlsx,.xls" style="display:none">
 
@@ -90,36 +89,8 @@
           <button class="btn-reset" onclick="resetApp()">← New analysis</button>
         </div>
 
-        <!-- Metrics -->
-        <div class="metrics-grid" id="metrics-grid"></div>
-
-        <!-- Day of week -->
-        <div class="result-card">
-          <div class="card-label">Revenue by day of week</div>
-          <div id="dow-chart"></div>
-        </div>
-
-        <!-- Heatmap -->
-        <div class="result-card">
-          <div class="card-label">Hourly heatmap — average revenue by day of week</div>
-          <div class="heatmap-wrap" id="heatmap"></div>
-          <div class="heatmap-legend">Darker teal = higher average revenue &nbsp;·&nbsp; Hover cells for exact figures</div>
-        </div>
-
-        <!-- Flags -->
-        <div class="result-card" id="flags-card">
-          <div class="card-label">Key flags</div>
-          <div id="flags"></div>
-        </div>
-
-        <!-- AI Brief -->
-        <div class="result-card brief-card">
-          <div class="card-label">
-            <span>AI ops narrative</span>
-            <span class="powered-by">Powered by Claude</span>
-          </div>
-          <div class="brief-text" id="brief-text"></div>
-        </div>
+        <!-- One section per venue, built by app.js -->
+        <div id="venue-results"></div>
 
       </div>
     </div>

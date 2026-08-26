@@ -366,6 +366,33 @@ body {
   transform: translateX(3px);
 }
 
+/* ── Venue sections ─────────────────────────────────────────────── */
+.venue-section {
+  margin-bottom: 2.5rem;
+  padding-top: 1.5rem;
+  border-top: 2px solid var(--rule);
+}
+
+.venue-section:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.venue-header {
+  margin-bottom: 1rem;
+}
+
+.venue-header h3 {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: -.01em;
+}
+
+.venue-header .results-meta {
+  margin-top: .125rem;
+}
+
 /* ── Results ────────────────────────────────────────────────────── */
 .results-header {
   display: flex;
