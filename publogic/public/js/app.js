@@ -609,7 +609,14 @@ async function streamBrief(prompt, targetEl) {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ prompt }),
     });
-    if (!response.ok) throw new Error(`API error ${response.status}`);
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const errBody = await response.json();
+        detail = errBody.error ? (typeof errBody.error === 'string' ? errBody.error : JSON.stringify(errBody.error)) : '';
+      } catch (e) { /* body wasn't JSON */ }
+      throw new Error(`API error ${response.status}${detail ? ' — ' + detail : ''}`);
+    }
 
     const reader  = response.body.getReader();
     const decoder = new TextDecoder();
