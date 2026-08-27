@@ -565,6 +565,105 @@ function productMixHTML(entries) {
   </div>`;
 }
 
+/* ── Weekly ops totals (aggregated across every uploaded week) ─────────────── */
+function weekRangeLabel(entries) {
+  const sorted = entries.slice().sort((a, b) => a.weekStart - b.weekStart);
+  const first = sorted[0], last = sorted[sorted.length - 1];
+  return `${fmtDate(first.weekStart)} – ${fmtDate(last.weekEnd)}`;
+}
+
+// Sums nettTotal/profitAmt (plus whatever extra fields are asked for, e.g.
+// transactions or qty) across every week's rows, grouped by name. profitPct
+// is deliberately NOT averaged row-by-row — instead a blended margin is
+// derived from the summed dollar figures at render time, same as the
+// single-week cards above (see cogsHTML's overallProfitPct).
+function aggregateRows(entries, extraFields) {
+  const byName = new Map();
+  entries.forEach(week => {
+    week.rows.forEach(r => {
+      const agg = byName.get(r.name) || { name: r.name, nettTotal: 0, profitAmt: 0, ...Object.fromEntries(extraFields.map(f => [f, 0])) };
+      agg.nettTotal += r.nettTotal;
+      agg.profitAmt += r.profitAmt;
+      extraFields.forEach(f => { agg[f] += r[f] || 0; });
+      byName.set(r.name, agg);
+    });
+  });
+  return Array.from(byName.values());
+}
+
+function blendedProfitPct(r) {
+  return r.nettTotal > 0 ? r.profitAmt / r.nettTotal * 100 : 0;
+}
+
+function staffTotalsHTML(entries) {
+  if (entries.length < 2) return '';
+  const weeks = entries.length;
+  const rows = aggregateRows(entries, ['transactions']).sort((a, b) => b.nettTotal - a.nettTotal);
+
+  const tableRows = rows.map(r => `
+    <tr>
+      <td>${r.name}</td>
+      <td class="num">${r.transactions}</td>
+      <td class="num">${cur(r.nettTotal)}</td>
+      <td class="num">${cur(r.nettTotal / weeks)}</td>
+      <td class="num">${blendedProfitPct(r).toFixed(0)}%</td>
+    </tr>`).join('');
+
+  return `<div class="result-card">
+    <div class="card-label">Staff performance — ${weeks}-week total (${weekRangeLabel(entries)})</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Name</th><th class="num">Total txns</th><th class="num">Total nett</th><th class="num">Avg/week</th><th class="num">Profit %</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+  </div>`;
+}
+
+function cogsTotalsHTML(entries) {
+  if (entries.length < 2) return '';
+  const weeks = entries.length;
+  const rows = aggregateRows(entries, []).sort((a, b) => b.nettTotal - a.nettTotal);
+
+  const tableRows = rows.map(r => `
+    <tr>
+      <td>${r.name}</td>
+      <td class="num">${cur(r.nettTotal)}</td>
+      <td class="num">${cur(r.nettTotal / weeks)}</td>
+      <td class="num">${blendedProfitPct(r).toFixed(0)}%</td>
+    </tr>`).join('');
+
+  return `<div class="result-card">
+    <div class="card-label">Margin by category — ${weeks}-week total (${weekRangeLabel(entries)})</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Category</th><th class="num">Total nett</th><th class="num">Avg/week</th><th class="num">Margin</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+  </div>`;
+}
+
+function productTotalsHTML(entries) {
+  if (entries.length < 2) return '';
+  const weeks = entries.length;
+  const rows = aggregateRows(entries, ['qty']);
+  const topSellers = rows.slice().sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 12);
+
+  const tableRows = topSellers.map(r => `
+    <tr>
+      <td>${r.name}</td>
+      <td class="num">${r.qty % 1 === 0 ? r.qty : r.qty.toFixed(1)}</td>
+      <td class="num">${cur(r.nettTotal)}</td>
+      <td class="num">${cur(r.nettTotal / weeks)}</td>
+      <td class="num">${blendedProfitPct(r).toFixed(0)}%</td>
+    </tr>`).join('');
+
+  return `<div class="result-card">
+    <div class="card-label">Top sellers — ${weeks}-week total (${weekRangeLabel(entries)})</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Product</th><th class="num">Total qty</th><th class="num">Total nett</th><th class="num">Avg/week</th><th class="num">Margin</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+  </div>`;
+}
+
 /* ── Venue narrative prompt ──────────────────────────────────────────────── */
 function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly) {
   const catLines = categoryStats.map(c =>
@@ -607,18 +706,36 @@ Hourly pattern is based on ${headlineLabel}:
       const avgProfitPct = rows.reduce((s, r) => s + r.profitPct, 0) / rows.length;
       parts.push(`Staff performance, week of ${weekLabel(w)} (team avg profit margin ${avgProfitPct.toFixed(0)}%):\n` +
         rows.slice(0, 8).map(r => `- ${r.name}: ${cur(r.nettTotal)} nett across ${r.transactions} transactions, ${r.profitPct.toFixed(0)}% profit margin`).join('\n'));
+      if (weekly.staffSales.length > 1) {
+        const weeks = weekly.staffSales.length;
+        const totals = aggregateRows(weekly.staffSales, ['transactions']).sort((a, b) => b.nettTotal - a.nettTotal);
+        parts.push(`Staff performance, ${weeks}-week total (${weekRangeLabel(weekly.staffSales)}):\n` +
+          totals.slice(0, 8).map(r => `- ${r.name}: ${cur(r.nettTotal)} total nett (avg ${cur(r.nettTotal / weeks)}/week) across ${r.transactions} transactions, ${blendedProfitPct(r).toFixed(0)}% blended profit margin`).join('\n'));
+      }
     }
     if (weekly.cogs.length) {
       const w = latestWeek(weekly.cogs);
       const rows = w.rows.slice().sort((a, b) => b.nettTotal - a.nettTotal);
       parts.push(`Margin by category, week of ${weekLabel(w)}:\n` +
         rows.map(r => `- ${r.name}: ${cur(r.nettTotal)} nett, ${r.profitPct.toFixed(0)}% margin`).join('\n'));
+      if (weekly.cogs.length > 1) {
+        const weeks = weekly.cogs.length;
+        const totals = aggregateRows(weekly.cogs, []).sort((a, b) => b.nettTotal - a.nettTotal);
+        parts.push(`Margin by category, ${weeks}-week total (${weekRangeLabel(weekly.cogs)}):\n` +
+          totals.map(r => `- ${r.name}: ${cur(r.nettTotal)} total nett (avg ${cur(r.nettTotal / weeks)}/week), ${blendedProfitPct(r).toFixed(0)}% blended margin`).join('\n'));
+      }
     }
     if (weekly.productMix.length) {
       const w = latestWeek(weekly.productMix);
       const top = w.rows.slice().sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 8);
       parts.push(`Top-selling products, week of ${weekLabel(w)}:\n` +
         top.map(r => `- ${r.name}: ${cur(r.nettTotal)} (${r.qty} sold, ${r.profitPct.toFixed(0)}% margin)`).join('\n'));
+      if (weekly.productMix.length > 1) {
+        const weeks = weekly.productMix.length;
+        const totals = aggregateRows(weekly.productMix, ['qty']).sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 8);
+        parts.push(`Top-selling products, ${weeks}-week total (${weekRangeLabel(weekly.productMix)}):\n` +
+          totals.map(r => `- ${r.name}: ${cur(r.nettTotal)} total (avg ${cur(r.nettTotal / weeks)}/week, ${r.qty} sold, ${blendedProfitPct(r).toFixed(0)}% blended margin)`).join('\n'));
+      }
     }
     weeklySection = `\n\nWeekly performance data:\n${parts.join('\n\n')}`;
   }
@@ -860,8 +977,11 @@ async function runAnalysis() {
 
     const weeklySection = hasWeekly ? `
       ${staffLeaderboardHTML(v.weekly.staffSales)}
+      ${staffTotalsHTML(v.weekly.staffSales)}
       ${cogsHTML(v.weekly.cogs)}
-      ${productMixHTML(v.weekly.productMix)}` : '';
+      ${cogsTotalsHTML(v.weekly.cogs)}
+      ${productMixHTML(v.weekly.productMix)}
+      ${productTotalsHTML(v.weekly.productMix)}` : '';
 
     const section = document.createElement('div');
     section.className = 'venue-section';
