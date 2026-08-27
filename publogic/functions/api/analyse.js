@@ -37,7 +37,12 @@ export async function onRequestPost(context) {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-5',
-        max_tokens: 1200,
+        // 1200 was sized for a single week of data. Now that the prompt can
+        // include both the latest-week and N-week-total sections (see
+        // buildPrompt's weeklySection), a full 4-5 paragraph narrative runs
+        // longer than that and was getting cut off mid-sentence at the
+        // max_tokens ceiling. 2200 leaves comfortable headroom.
+        max_tokens: 2200,
         // Claude Sonnet 5 has adaptive thinking on by default with no
         // configuration needed. Thinking tokens count against max_tokens
         // alongside the response text, so without this the model can burn
