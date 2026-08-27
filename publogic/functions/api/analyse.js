@@ -38,6 +38,15 @@ export async function onRequestPost(context) {
       body: JSON.stringify({
         model: 'claude-sonnet-5',
         max_tokens: 1200,
+        // Claude Sonnet 5 has adaptive thinking on by default with no
+        // configuration needed. Thinking tokens count against max_tokens
+        // alongside the response text, so without this the model can burn
+        // the entire budget "thinking" and return zero visible narrative —
+        // a stream that looks successful (200 OK) but renders as a blank
+        // box, with stop_reason "max_tokens" and no text content block ever
+        // started. This app just needs a direct write-up from stats already
+        // in the prompt, not multi-step reasoning, so thinking is disabled.
+        thinking: { type: 'disabled' },
         stream: true,
         messages: [{ role: 'user', content: prompt }],
       }),
