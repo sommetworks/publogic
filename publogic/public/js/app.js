@@ -159,16 +159,42 @@ function resolveVenueKey(venues, rawName) {
 }
 
 /* ── Weekly report table parsing ─────────────────────────────────────────── */
+// Bepoz reprints the report's column-header row (plus a "(cont.)" page
+// marker) at the top of every new page. When a product/category/staff list
+// continues across a page break, that repeated header can run directly into
+// the next row's real name with no separator — e.g. "...NettTotal of Sales
+// Amt of Sales Veuve Clicquot NV" instead of just "Veuve Clicquot NV".
+// cleanLeakedName() recovers the real trailing name by cutting after the
+// last recognisable header-column marker; if nothing recoverable is left,
+// the row is dropped (returns null) rather than shown with a corrupted
+// label — losing one row's data is far better than mislabeling it.
+const HEADER_LEAK_WORDS = /\b(Product Name|Size Name|Units Sold|NettTotal|CostEx|Profit Amt|CostInc|Gross Sales|Last Trans)\b/i;
+const HEADER_LEAK_MARKERS = /(?:of\s+Sales|Last\s+Trans\.?)/gi;
+function cleanLeakedName(raw) {
+  if (!HEADER_LEAK_WORDS.test(raw)) return raw;
+  let lastEnd = -1, m;
+  HEADER_LEAK_MARKERS.lastIndex = 0;
+  while ((m = HEADER_LEAK_MARKERS.exec(raw))) lastEnd = m.index + m[0].length;
+  const cleaned = lastEnd >= 0 ? raw.slice(lastEnd).trim() : raw.trim();
+  if (!cleaned || cleaned.length < 2 || HEADER_LEAK_WORDS.test(cleaned)) return null;
+  return cleaned;
+}
+
 // Row shape: "Name  <int qty>  $gross  -$discount  $nett  dd.dd%  $cost
 // $profit  dd.dd%  DD-Mon-YYYY HH:MM:SS AM/PM". Column gaps are sometimes
 // zero-width in extracted text, so separators are \s* not \s+ throughout.
 function parseStaffSalesRows(text) {
-  const rowRe = /([A-Za-z][A-Za-z .'-]*?)\s+(\d+)\s+\$([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})\s+([\d.]+)%\s*(-?)\$([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+(-?[\d.]+)%\s*(\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2}\s*[AP]M)/g;
+  // Name capture is bounded (not open-ended) so a repeated page-header line
+  // can never run away and swallow real rows beyond it — see
+  // cleanLeakedName() above for what happens when one leaks in anyway.
+  const rowRe = /([A-Za-z][A-Za-z .'-]{0,149}?)\s+(\d+)\s+\$([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})\s+([\d.]+)%\s*(-?)\$([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+(-?[\d.]+)%\s*(\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2}\s*[AP]M)/g;
   const rows = [];
   let m;
   while ((m = rowRe.exec(text))) {
+    const name = cleanLeakedName(m[1].trim());
+    if (name === null) continue;
     rows.push({
-      name: m[1].trim(),
+      name,
       transactions: parseInt(m[2], 10),
       grossSales: parseFloat(m[3].replace(/,/g, '')),
       discount: (m[4] ? -1 : 1) * parseFloat(m[5].replace(/,/g, '')),
@@ -190,12 +216,15 @@ function parseStaffSalesRows(text) {
 function parseSizedRows(text) {
   // A handful of heavily-discounted items sell at a loss, so profit $ and %
   // (and occasionally nett total, for returns/adjustments) can be negative.
-  const rowRe = /([A-Za-z][\w &+'./()%$-]*?)\s+All Sizes\s+([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+(-?[\d.]+)%\s*\$([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+(-?[\d.]+)%\s*\$([\d,]+\.\d{2})/g;
+  // Name capture is bounded (not open-ended) — see cleanLeakedName() above.
+  const rowRe = /([A-Za-z][\w &+'./()%$-]{0,149}?)\s+All Sizes\s+([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+(-?[\d.]+)%\s*\$([\d,]+\.\d{2})\s+(-?)\$([\d,]+\.\d{2})\s+(-?[\d.]+)%\s*\$([\d,]+\.\d{2})/g;
   const rows = [];
   let m;
   while ((m = rowRe.exec(text))) {
+    const name = cleanLeakedName(m[1].trim());
+    if (name === null) continue;
     rows.push({
-      name: m[1].trim(),
+      name,
       qty: parseFloat(m[2].replace(/,/g, '')),
       nettTotal: (m[3] ? -1 : 1) * parseFloat(m[4].replace(/,/g, '')),
       pctOfNett: parseFloat(m[5]),

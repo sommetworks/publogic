@@ -633,6 +633,15 @@ body {
   white-space: nowrap;
 }
 
+/* The first column (name/product/category) can be long — let it wrap and
+   cap its width, rather than forcing the whole table wider. Numeric
+   columns stay single-line and right-aligned for scannability. */
+.data-table td:first-child, .data-table th:first-child {
+  white-space: normal;
+  word-break: break-word;
+  max-width: 220px;
+}
+
 .data-table tbody tr:last-child td { border-bottom: none; }
 .data-table tbody tr:hover { background: var(--surface-2); }
 .data-table th.num, .data-table td.num { text-align: right; font-family: var(--font-mono); }
