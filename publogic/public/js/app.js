@@ -28,15 +28,22 @@ let allFiles = [];
 // which label follows which (field order varies: daily reports go
 // Venue/Store/Till/Period, weekly ones go Group/Period, Stock Loss puts
 // Period before Venue, etc).
-const HEADER_STOP_LABELS = ['Venue', 'Store', 'Till', 'Period', 'Group', 'From Shift', 'To Shift', 'Flags', 'FILTER', 'Product'];
+const HEADER_STOP_LABELS = ['Venue', 'Store', 'Till', 'Display Period', 'Period', 'Group', 'From Shift', 'To Shift', 'Flags', 'FILTER', 'Product'];
 
 // Pulls "Label : value" out of the flattened report text, stopping at the
 // next header label (whichever comes first) or end of text.
+//
+// Labels are word-boundary anchored (\b) — without it, a bare "Venue"
+// pattern matches as a substring inside unrelated words like "Revenue:",
+// which shows up repeatedly in Period Summary reports' per-category sales
+// breakdown ("Event Revenue:", etc). An unanchored match there hijacks the
+// label search and swallows everything up to the *real* field further
+// down the text.
 function extractField(text, label) {
   // Most labels use ":", but FILTER lines use "=" — accept either.
   const stopPattern = HEADER_STOP_LABELS.filter(l => l !== label)
-    .map(l => l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[:=]').join('|');
-  const re = new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:[\\s,]*(.{1,120}?)\\s*(?:' + stopPattern + '|$)', 'i');
+    .map(l => '\\b' + l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[:=]').join('|');
+  const re = new RegExp('\\b' + label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:[\\s,]*(.{1,120}?)\\s*(?:' + stopPattern + '|$)', 'i');
   const m = text.match(re);
   return m ? m[1].trim().replace(/,$/, '') : null;
 }
@@ -45,7 +52,10 @@ function extractTitle(text) {
   // Group is also a valid boundary (Staff Sales has no Product/Venue field
   // at all) — but "Product Group :" is one label, not two, so a Group
   // match immediately after "Product " doesn't count.
-  const m = text.match(/^\s*(.*?)\s*(?:Product\s*:|Venue\s*:|(?<!Product\s)Group\s*:)/i);
+  // Same word-boundary reasoning as extractField above: without \b, "Venue"
+  // can match inside "Revenue" deep in the report body and drag the
+  // "title" capture across nearly the whole document.
+  const m = text.match(/^\s*(.*?)\s*(?:\bProduct\s*:|\bVenue\s*:|(?<!Product\s)\bGroup\s*:)/i);
   return m ? m[1].trim() : '';
 }
 
@@ -124,7 +134,11 @@ function classifyReport(text) {
   } else if (/food/.test(t)) {
     category = 'food';
     subVenue = isAllStores ? null : store;
-  } else if (/main\s*bar|\bmbar\b/.test(t)) {
+  } else if (/main\s*bar|\bmbar\b|\bhotel\b/.test(t)) {
+    // Some venues rename their main-bar report over time without changing
+    // its Store field — Harbord Hotel's "Mbar Time Break Alcoholic" and
+    // "HH Hotel Time Break Alc" are confirmed to be the same report family
+    // (both against Store "HH Hotel"), just from different periods.
     category = 'bar_bev';
   } else {
     // Anything else beverage/alcoholic-flavoured that isn't the main bar
@@ -142,8 +156,32 @@ function classifyReport(text) {
 // whichever name is more descriptive as the canonical key.
 function resolveVenueKey(venues, rawName) {
   const norm = s => s.toLowerCase().trim();
+  const isGeneric = s => /^all venues?$/i.test(s);
   const n = norm(rawName);
-  for (const key of Object.keys(venues)) {
+  const keys = Object.keys(venues);
+
+  // Some Bepoz Period Summary exports carry a generic "All Venues" Venue
+  // filter even when the Store field is store-specific (and even when a
+  // sibling report for the same store, like its Time Break export, correctly
+  // says the real venue name) — seen on real Harbord Hotel data. Don't let
+  // that spawn a phantom "All Venues" venue: fold it into the one real venue
+  // already in this batch, in whichever order the files land.
+  if (isGeneric(n)) {
+    const realKeys = keys.filter(k => !isGeneric(norm(k)));
+    if (realKeys.length === 1) return realKeys[0];
+    // Zero or multiple real venues so far — genuinely ambiguous, fall
+    // through to the normal matching below (reuse/start an "All Venues"
+    // bucket rather than guess).
+  } else {
+    const genericKeys = keys.filter(k => isGeneric(norm(k)));
+    if (genericKeys.length === 1 && keys.length === 1) {
+      venues[rawName] = venues[genericKeys[0]];
+      delete venues[genericKeys[0]];
+      return rawName;
+    }
+  }
+
+  for (const key of keys) {
     const nk = norm(key);
     if (nk === n) return key;
     if (nk.includes(n) || n.includes(nk)) {
@@ -235,6 +273,45 @@ function parseSizedRows(text) {
     });
   }
   return rows;
+}
+
+/* ── Daily Period Summary parsing ────────────────────────────────────────── */
+// Bepoz's Period Summary export lays four independent tables (Stock, Sales,
+// Discount, Product Sortgroup) out side by side in one sheet. Flattening
+// joins them row by row, which scrambles the columns together, but every
+// figure below is still uniquely labelled, so label-anchored regexes — not
+// row position — pull them out reliably. Some rows (e.g. Pricing Variance)
+// are omitted entirely by Bepoz on a $0 day, so nothing here assumes a fixed
+// layout or that every field is present.
+function moneyAfter(text, labelPattern) {
+  const re = new RegExp(labelPattern + '\\s*:?\\s*\\$?(-?[\\d,]+\\.\\d{2})', 'i');
+  const m = text.match(re);
+  return m ? parseFloat(m[1].replace(/,/g, '')) : null;
+}
+
+function parsePeriodSummary(text) {
+  const grossSales   = moneyAfter(text, 'Gross Sales');
+  const nettTotal    = moneyAfter(text, 'Nett Total');
+  // Negative lookahead so "Cost of Sales Adjusted" doesn't get matched by
+  // the plain "Cost of Sales" search.
+  const costOfSales  = moneyAfter(text, 'Cost of Sales(?!\\s*Adjusted)');
+
+  const profitM = text.match(/\bProfit(?!\s*Adjusted)\s*:?\s*(-?[\d.]+)%\s*\$?(-?[\d,]+\.\d{2})/i);
+  const profitPct = profitM ? parseFloat(profitM[1]) : null;
+  const profitAmt = profitM ? parseFloat(profitM[2].replace(/,/g, '')) : null;
+
+  const bankedTotal = moneyAfter(text, 'Banked Total');
+  const drawerM = text.match(/Drawer Tot\s*:?\s*\$?(-?[\d,]+\.\d{2})\s*\$?(-?[\d,]+\.\d{2})/i);
+  const drawerCounted     = drawerM ? parseFloat(drawerM[1].replace(/,/g, '')) : null;
+  const drawerTheoretical = drawerM ? parseFloat(drawerM[2].replace(/,/g, '')) : null;
+
+  // The sign is already on the number ("-$22.40"); the trailing Over/Under
+  // word is a redundant label, not needed to read the direction.
+  const diffM = text.match(/\bDifference\s*:?\s*(-?)\$?([\d,]+\.\d{2})/i);
+  const difference = diffM ? (diffM[1] ? -1 : 1) * parseFloat(diffM[2].replace(/,/g, '')) : null;
+
+  if (nettTotal === null) return null; // no Sales Summary found — not a usable report
+  return { grossSales, nettTotal, costOfSales, profitPct, profitAmt, bankedTotal, drawerCounted, drawerTheoretical, difference };
 }
 
 /* ── Date / currency helpers ─────────────────────────────────────────────── */
@@ -664,8 +741,50 @@ function productTotalsHTML(entries) {
   </div>`;
 }
 
+/* ── Daily Period Summary rendering ──────────────────────────────────────── */
+// A till variance under $5 is normal float/rounding noise, not worth
+// flagging — only genuine short/over discrepancies surface as a warning.
+const TILL_VARIANCE_THRESHOLD = 5;
+
+function periodSummaryHTML(storeEntry) {
+  const days = Object.values(storeEntry.byDate).sort((a, b) => b.date - a.date);
+  if (!days.length) return '';
+
+  const fmtMoney = v => v === null || v === undefined ? '—' : cur(v);
+
+  const tableRows = days.map(d => {
+    const flagged = d.difference !== null && Math.abs(d.difference) >= TILL_VARIANCE_THRESHOLD;
+    const varCell = d.difference === null ? '—' :
+      `${cur(d.difference)}${flagged ? ' <span class="flag-icon" title="Counted ' + fmtMoney(d.drawerCounted) + ' vs theoretical ' + fmtMoney(d.drawerTheoretical) + '">⚠</span>' : ''}`;
+    return `
+    <tr>
+      <td>${fmtDate(d.date)}</td>
+      <td class="num">${fmtMoney(d.grossSales)}</td>
+      <td class="num">${fmtMoney(d.nettTotal)}</td>
+      <td class="num">${fmtMoney(d.costOfSales)}</td>
+      <td class="num">${fmtMoney(d.profitAmt)}</td>
+      <td class="num">${d.profitPct !== null ? d.profitPct.toFixed(0) + '%' : '—'}</td>
+      <td class="num">${varCell}</td>
+    </tr>`;
+  }).join('');
+
+  const flaggedDays = days.filter(d => d.difference !== null && Math.abs(d.difference) >= TILL_VARIANCE_THRESHOLD);
+  const flags = flaggedDays.length
+    ? `<div class="flag warn"><span class="flag-icon">⚠</span><span>${flaggedDays.length} day${flaggedDays.length === 1 ? '' : 's'} with a till variance of ${cur(TILL_VARIANCE_THRESHOLD)} or more: ${flaggedDays.map(d => `${fmtDate(d.date)} (${d.difference < 0 ? 'short' : 'over'} ${cur(Math.abs(d.difference))})`).join(', ')} — worth checking against the banking record</span></div>`
+    : '';
+
+  return `<div class="result-card">
+    <div class="card-label">Daily sales &amp; margin — ${storeEntry.label}</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Date</th><th class="num">Gross sales</th><th class="num">Nett sales</th><th class="num">Cost of sales</th><th class="num">Profit</th><th class="num">Margin</th><th class="num">Till variance</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+    ${flags}
+  </div>`;
+}
+
 /* ── Venue narrative prompt ──────────────────────────────────────────────── */
-function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly) {
+function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary) {
   const catLines = categoryStats.map(c =>
     `- ${CATEGORY_LABELS[c.key] || c.key}: total ${cur(c.stats.total)} over ${c.stats.days.length} days, daily avg ${cur(c.stats.avg)}`
   ).join('\n');
@@ -740,10 +859,32 @@ Hourly pattern is based on ${headlineLabel}:
     weeklySection = `\n\nWeekly performance data:\n${parts.join('\n\n')}`;
   }
 
-  return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && weeklySection ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
-${dailySection}${weeklySection}
+  let periodSummarySection = '';
+  const psStores = periodSummary ? Object.values(periodSummary) : [];
+  if (psStores.length) {
+    const parts = psStores.map(store => {
+      const days = Object.values(store.byDate).sort((a, b) => b.date - a.date);
+      if (!days.length) return '';
+      const lines = days.slice(0, 7).map(d => {
+        const bits = [];
+        if (d.grossSales !== null) bits.push(`${cur(d.grossSales)} gross`);
+        if (d.nettTotal !== null) bits.push(`${cur(d.nettTotal)} nett`);
+        if (d.costOfSales !== null) bits.push(`${cur(d.costOfSales)} cost of sales`);
+        if (d.profitAmt !== null && d.profitPct !== null) bits.push(`${cur(d.profitAmt)} profit (${d.profitPct.toFixed(0)}%)`);
+        if (d.difference !== null && Math.abs(d.difference) >= TILL_VARIANCE_THRESHOLD) {
+          bits.push(`till ${d.difference < 0 ? 'short' : 'over'} ${cur(Math.abs(d.difference))}`);
+        }
+        return `- ${fmtDate(d.date)}: ${bits.join(', ')}`;
+      });
+      return `Daily sales & margin, ${store.label}:\n${lines.join('\n')}`;
+    }).filter(Boolean);
+    if (parts.length) periodSummarySection = `\n\nDaily Period Summary data:\n${parts.join('\n\n')}`;
+  }
 
-Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), category or product margin issues worth a pricing review, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
+  return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && (weeklySection || periodSummarySection) ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
+${dailySection}${weeklySection}${periodSummarySection}
+
+Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
 }
 
 async function streamBrief(prompt, targetEl) {
@@ -828,12 +969,22 @@ async function runAnalysis() {
     }
 
     const vKey = resolveVenueKey(venues, info.venue);
-    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: [] }, periodSummaryCount: 0, unsupportedWeeklyCount: 0 };
+    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0 };
     const v = venues[vKey];
 
     if (info.category === 'period_summary') {
-      periodSummarySkipped++;
-      v.periodSummaryCount++;
+      const psDate = extractShiftDate(text) || extractDateFromFilename(f.name);
+      const psData = parsePeriodSummary(text);
+      if (!psDate || !psData) {
+        periodSummarySkipped++;
+        v.periodSummaryCount++;
+        failureSamples.push(`${f.name}: recognised as a Period Summary but couldn't find its sales figures or date`);
+        continue;
+      }
+      const storeKey = (info.store || 'All Stores').trim();
+      v.periodSummary[storeKey] = v.periodSummary[storeKey] || { label: storeKey, byDate: {} };
+      v.periodSummary[storeKey].byDate[dateKey(psDate)] = { date: psDate, ...psData };
+      parsed++;
       continue;
     }
 
@@ -983,6 +1134,10 @@ async function runAnalysis() {
       ${productMixHTML(v.weekly.productMix)}
       ${productTotalsHTML(v.weekly.productMix)}` : '';
 
+    const periodSummaryList = Object.values(v.periodSummary || {});
+    const hasPeriodSummary = periodSummaryList.length > 0;
+    const periodSummarySection = periodSummaryList.map(periodSummaryHTML).join('');
+
     const section = document.createElement('div');
     section.className = 'venue-section';
     section.innerHTML = `
@@ -994,6 +1149,7 @@ async function runAnalysis() {
       ${subVenueList.length ? `<div class="result-card"><div class="card-label">Sub-venues / satellite bars</div><div class="metrics-grid">${subVenueHTML}</div></div>` : ''}
       ${chartSection}
       ${weeklySection}
+      ${periodSummarySection}
       <div class="result-card brief-card">
         <div class="card-label">
           <span>AI ops narrative</span>
@@ -1003,8 +1159,8 @@ async function runAnalysis() {
       </div>`;
     container.appendChild(section);
 
-    if (primary || hasWeekly) {
-      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly);
+    if (primary || hasWeekly || hasPeriodSummary) {
+      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary);
       briefTargets.push({ prompt, el: section.querySelector(`#brief-${vslug}`) });
     } else {
       section.querySelector(`#brief-${vslug}`).textContent = 'Not enough category data for a narrative on this venue.';
