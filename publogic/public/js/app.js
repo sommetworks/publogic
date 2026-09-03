@@ -64,7 +64,16 @@ function extractTitle(text) {
 // for "Yesterday" reports printed the next morning is a day later than the
 // actual trading day.
 function extractShiftDate(text) {
-  const m = text.match(/From Shift:\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4})/i);
+  let m = text.match(/From Shift:\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4})/i);
+  if (!m) {
+    // Bepoz's XLSX exports don't carry a "From Shift:" line at all — the
+    // trading date instead lives in "Display Period: Yesterday (Shift: 1
+    // 02/08/2026)" on the Criteria sheet. Without this fallback the date
+    // silently falls back to the filename's *print* date, which for
+    // "Yesterday" reports printed the next morning is a day later than the
+    // actual trading day.
+    m = text.match(/Display Period:.{0,40}?Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4})/i);
+  }
   if (!m) return null;
   const d = new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
   return isNaN(d.getTime()) ? null : d;
@@ -334,11 +343,33 @@ async function extractPDFText(file) {
   return text;
 }
 
+// Flattens every cell in the workbook — including each sheet's own NAME —
+// into one continuous space-joined string, the same shape extractPDFText
+// produces for a page (content.items.map(i => i.str).join(' ')). This
+// matters because classifyReport/extractField/extractTitle/extractShiftDate
+// are all regex-scanned against that flattened shape and can't cross a
+// newline; a plain sheet_to_csv() export (one row per line) breaks them,
+// because Bepoz's XLSX exports split a report across two sheets — the data
+// sheet (whose NAME is the report title, e.g. "Bombie Food Time Break Yst
+// REV" — that title never appears in any cell) and a second "Criteria ..."
+// sheet several rows deep holding Venue/Store/Display Period — so the title
+// and the Venue: field a classifier needs are never on the same CSV line.
+// Flattening the whole workbook into one line reunites them, exactly as a
+// PDF page already does.
 async function extractXLSXText(file) {
   const buf = await file.arrayBuffer();
   const wb  = XLSX.read(buf, { type: 'array' });
   let out   = '';
-  wb.SheetNames.forEach(sn => { out += XLSX.utils.sheet_to_csv(wb.Sheets[sn]) + '\n'; });
+  wb.SheetNames.forEach(sn => {
+    out += sn + ' ';
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: '', raw: false });
+    rows.forEach(row => {
+      row.forEach(cell => {
+        const s = String(cell).replace(/\r?\n/g, ' ').trim();
+        if (s) out += s + ' ';
+      });
+    });
+  });
   return out;
 }
 
