@@ -323,6 +323,68 @@ function parsePeriodSummary(text) {
   return { grossSales, nettTotal, costOfSales, profitPct, profitAmt, bankedTotal, drawerCounted, drawerTheoretical, difference };
 }
 
+// The Discount Totals table is a genuine exception to "everything is
+// label-anchored regex on flattened text": it's a repeating list of ~20-30
+// rows (one per discount/pricing-variance reason configured in Bepoz — the
+// exact reasons, their wording, and how many fire on a given day all vary
+// by venue and even by store, confirmed on real Harbord Hotel data), sitting
+// in its own column block next to three unrelated tables that share the
+// same rows. Flattening interleaves all four tables' cells row by row, which
+// destroys any way to tell where one reason's label/qty/amount ends and the
+// next table's unrelated cell begins. So this reads the workbook directly:
+// find the "DISCOUNT TOTALS:" header cell, then walk straight down its
+// column (label, qty, amount) until the label cell goes blank — that blank
+// is the real end of the table, not a fixed row count.
+function parseDiscounts(workbook) {
+  if (!workbook) return null; // not available for PDF Period Summaries
+  for (const sn of workbook.SheetNames) {
+    if (/^criteria/i.test(sn)) continue;
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sn], { header: 1, defval: '', raw: false });
+    if (!rows.length) continue;
+    const header = rows[0];
+    const discCol = header.findIndex(c => String(c).trim().toUpperCase() === 'DISCOUNT TOTALS:');
+    if (discCol < 0) continue;
+
+    const items = [];
+    for (let i = 1; i < rows.length; i++) {
+      const label = rows[i][discCol];
+      if (!label || !String(label).trim()) break;
+      const qty = parseInt(String(rows[i][discCol + 1]).replace(/,/g, ''), 10) || 0;
+      const amount = parseFloat(String(rows[i][discCol + 2] || '').replace(/[$,]/g, '')) || 0;
+      if (qty === 0 && amount === 0) continue; // reason didn't fire this day
+      items.push({ label: String(label).trim(), qty, amount });
+    }
+    return { items };
+  }
+  return null; // this workbook's data sheet has no Discount Totals column
+}
+
+// Rolls a store's per-day discount breakdowns up into one ranked list for
+// the whole period, and expresses the total against gross sales as a rough
+// "discount rate" — the cleanest honest read on margin impact available
+// here, since Bepoz doesn't expose a clean per-reason link to Nett/Profit.
+function aggregateDiscounts(days) {
+  const byLabel = {};
+  let grossTotal = 0;
+  let sawAny = false;
+  days.forEach(d => {
+    if (d.grossSales) grossTotal += d.grossSales;
+    if (!d.discounts || !d.discounts.items) return;
+    sawAny = true;
+    d.discounts.items.forEach(it => {
+      byLabel[it.label] = byLabel[it.label] || { label: it.label, qty: 0, amount: 0 };
+      byLabel[it.label].qty += it.qty;
+      byLabel[it.label].amount += it.amount;
+    });
+  });
+  if (!sawAny) return null;
+  const rows = Object.values(byLabel).filter(r => r.amount !== 0 || r.qty !== 0)
+    .sort((a, b) => a.amount - b.amount); // most negative (biggest giveaway) first
+  const total = rows.reduce((s, r) => s + r.amount, 0);
+  const pctOfGross = grossTotal > 0 ? Math.abs(total) / grossTotal * 100 : null;
+  return { rows, total, pctOfGross };
+}
+
 /* ── Date / currency helpers ─────────────────────────────────────────────── */
 function dateKey(d) { return d.toISOString().slice(0,10); }
 function dow(d)     { return (d.getDay() + 6) % 7; }
@@ -356,6 +418,9 @@ async function extractPDFText(file) {
 // and the Venue: field a classifier needs are never on the same CSV line.
 // Flattening the whole workbook into one line reunites them, exactly as a
 // PDF page already does.
+// Returns both the flattened text (used everywhere else in the app) and the
+// parsed workbook itself — parseDiscounts needs the real rows/columns of the
+// sheet, which flattening destroys (see its comment for why).
 async function extractXLSXText(file) {
   const buf = await file.arrayBuffer();
   const wb  = XLSX.read(buf, { type: 'array' });
@@ -370,7 +435,7 @@ async function extractXLSXText(file) {
       });
     });
   });
-  return out;
+  return { text: out, workbook: wb };
 }
 
 /* ── Hourly parsing ──────────────────────────────────────────────────────── */
@@ -814,6 +879,35 @@ function periodSummaryHTML(storeEntry) {
   </div>`;
 }
 
+function discountBreakdownHTML(storeEntry) {
+  const agg = aggregateDiscounts(Object.values(storeEntry.byDate));
+  if (!agg) return ''; // no discount data available for this store this period (e.g. PDF Period Summaries)
+
+  if (!agg.rows.length) {
+    return `<div class="result-card">
+    <div class="card-label">Discounts — ${storeEntry.label}</div>
+    <div class="metric-sub">No discounts recorded this period.</div>
+  </div>`;
+  }
+
+  const tableRows = agg.rows.map(r => `
+    <tr>
+      <td>${r.label}</td>
+      <td class="num">${r.qty}</td>
+      <td class="num">${cur(r.amount)}</td>
+      <td class="num">${agg.total !== 0 ? (r.amount / agg.total * 100).toFixed(0) + '%' : '—'}</td>
+    </tr>`).join('');
+
+  return `<div class="result-card">
+    <div class="card-label">Discounts — ${storeEntry.label}</div>
+    <div class="metric-sub">${cur(Math.abs(agg.total))} given away over the period${agg.pctOfGross !== null ? ` — ${agg.pctOfGross.toFixed(1)}% of gross sales` : ''}</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Reason</th><th class="num">Qty</th><th class="num">Amount</th><th class="num">% of total</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+  </div>`;
+}
+
 /* ── Venue narrative prompt ──────────────────────────────────────────────── */
 function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary) {
   const catLines = categoryStats.map(c =>
@@ -907,7 +1001,15 @@ Hourly pattern is based on ${headlineLabel}:
         }
         return `- ${fmtDate(d.date)}: ${bits.join(', ')}`;
       });
-      return `Daily sales & margin, ${store.label}:\n${lines.join('\n')}`;
+      let block = `Daily sales & margin, ${store.label}:\n${lines.join('\n')}`;
+
+      const discAgg = aggregateDiscounts(days);
+      if (discAgg && discAgg.rows.length) {
+        const top = discAgg.rows.slice(0, 5).map(r => `${r.label} ${cur(r.amount)} (${r.qty}x)`).join(', ');
+        block += `\nDiscounts, ${store.label}: ${cur(Math.abs(discAgg.total))} given away this period` +
+          `${discAgg.pctOfGross !== null ? ` (${discAgg.pctOfGross.toFixed(1)}% of gross sales)` : ''} — top reasons: ${top}`;
+      }
+      return block;
     }).filter(Boolean);
     if (parts.length) periodSummarySection = `\n\nDaily Period Summary data:\n${parts.join('\n\n')}`;
   }
@@ -915,7 +1017,7 @@ Hourly pattern is based on ${headlineLabel}:
   return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && (weeklySection || periodSummarySection) ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
 ${dailySection}${weeklySection}${periodSummarySection}
 
-Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
+Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, which discount reasons are giving away the most margin and whether that looks justified, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
 }
 
 async function streamBrief(prompt, targetEl) {
@@ -981,11 +1083,15 @@ async function runAnalysis() {
     setProgress(pct, `Reading file ${i + 1} of ${allFiles.length}`, f.name.slice(0, 50));
     if (i % 5 === 0) await new Promise(r => setTimeout(r, 0)); // keep UI responsive
 
-    let text;
+    let text, xlsxWorkbook = null;
     try {
-      text = f.name.toLowerCase().endsWith('.pdf')
-        ? await extractPDFText(f)
-        : await extractXLSXText(f);
+      if (f.name.toLowerCase().endsWith('.pdf')) {
+        text = await extractPDFText(f);
+      } else {
+        const r = await extractXLSXText(f);
+        text = r.text;
+        xlsxWorkbook = r.workbook; // only needed for parseDiscounts below
+      }
     } catch (e) {
       failed++;
       failureSamples.push(`${f.name}: could not read file (${e.message})`);
@@ -1012,9 +1118,10 @@ async function runAnalysis() {
         failureSamples.push(`${f.name}: recognised as a Period Summary but couldn't find its sales figures or date`);
         continue;
       }
+      const discounts = parseDiscounts(xlsxWorkbook); // null for PDF Period Summaries
       const storeKey = (info.store || 'All Stores').trim();
       v.periodSummary[storeKey] = v.periodSummary[storeKey] || { label: storeKey, byDate: {} };
-      v.periodSummary[storeKey].byDate[dateKey(psDate)] = { date: psDate, ...psData };
+      v.periodSummary[storeKey].byDate[dateKey(psDate)] = { date: psDate, ...psData, discounts };
       parsed++;
       continue;
     }
@@ -1167,7 +1274,9 @@ async function runAnalysis() {
 
     const periodSummaryList = Object.values(v.periodSummary || {});
     const hasPeriodSummary = periodSummaryList.length > 0;
-    const periodSummarySection = periodSummaryList.map(periodSummaryHTML).join('');
+    const periodSummarySection = periodSummaryList
+      .map(store => periodSummaryHTML(store) + discountBreakdownHTML(store))
+      .join('');
 
     const section = document.createElement('div');
     section.className = 'venue-section';
