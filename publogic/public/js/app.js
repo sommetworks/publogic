@@ -1238,30 +1238,37 @@ async function runAnalysis() {
     const subVenueList = Object.values(v.subVenues);
     const subVenueHTML = subVenueList.map(subVenueCardHTML).join('');
 
-    const primary = catStats[0]; // headline chart driver, by HEADLINE_PRIORITY order
+    const primary = catStats[0]; // headline category for the AI narrative's hourly deep-dive, by HEADLINE_PRIORITY order
     const vslug = slug(venueName);
 
-    let chartSection = '';
-    if (primary) {
-      const label = CATEGORY_LABELS[primary.key] || primary.key;
-      chartSection = `
+    // Every category with data gets its own day-of-week chart + hourly heatmap
+    // + flags, not just the headline one — a venue's main bar is just as
+    // operationally relevant as its food, and burying it in a metric card
+    // with no chart hid that. Rendered in the same priority order as before
+    // (dept, food, bar_bev, bshop, then anything else).
+    const chartSection = catStats.map(c => {
+      const label = CATEGORY_LABELS[c.key] || c.key;
+      return `
         <div class="result-card">
           <div class="card-label">Revenue by day of week — ${label}</div>
-          <div>${dowChartHTML(primary.stats)}</div>
+          <div>${dowChartHTML(c.stats)}</div>
         </div>
         <div class="result-card">
           <div class="card-label">Hourly heatmap — ${label}</div>
-          <div class="heatmap-wrap">${heatmapHTML(primary.stats)}</div>
+          <div class="heatmap-wrap">${heatmapHTML(c.stats)}</div>
           <div class="heatmap-legend">Darker teal = higher average revenue &nbsp;·&nbsp; Hover cells for exact figures</div>
         </div>
         <div class="result-card">
           <div class="card-label">Key flags — ${label}</div>
-          <div>${flagsHTML(primary.stats, label)}</div>
+          <div>${flagsHTML(c.stats, label)}</div>
         </div>`;
-    }
+    }).join('');
 
-    const dateRange = primary
-      ? `${fmtDate(primary.stats.days[0].date)} – ${fmtDate(primary.stats.days[primary.stats.days.length - 1].date)}`
+    // Venue-level date range spans every category, not just the headline one,
+    // since categories can cover slightly different periods.
+    const allDays = catStats.flatMap(c => c.stats.days);
+    const dateRange = allDays.length
+      ? `${fmtDate(allDays.reduce((a, b) => a.date < b.date ? a : b).date)} – ${fmtDate(allDays.reduce((a, b) => a.date > b.date ? a : b).date)}`
       : '';
 
     const weeklySection = hasWeekly ? `
