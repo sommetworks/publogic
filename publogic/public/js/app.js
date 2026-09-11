@@ -349,10 +349,19 @@ function parseDiscounts(workbook) {
     for (let i = 1; i < rows.length; i++) {
       const label = rows[i][discCol];
       if (!label || !String(label).trim()) break;
+      const cleanLabel = String(label).trim();
+      // Pricing Variance isn't a discount reason — it's Bepoz's own rollup
+      // row, always equal to the sum of every other row in this table
+      // (confirmed exactly on real Harbord Hotel data: e.g. Main Bar's
+      // Pricing Variance of -$1,356.15 matched its other 8 reasons' total
+      // to the cent). Including it double-counts the "total discounted"
+      // figure and makes it look responsible for ~50% of all discounts by
+      // definition, not because it's actually a reason anyone chose.
+      if (/^pricing variance$/i.test(cleanLabel)) continue;
       const qty = parseInt(String(rows[i][discCol + 1]).replace(/,/g, ''), 10) || 0;
       const amount = parseFloat(String(rows[i][discCol + 2] || '').replace(/[$,]/g, '')) || 0;
       if (qty === 0 && amount === 0) continue; // reason didn't fire this day
-      items.push({ label: String(label).trim(), qty, amount });
+      items.push({ label: cleanLabel, qty, amount });
     }
     return { items };
   }
