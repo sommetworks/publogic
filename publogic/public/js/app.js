@@ -177,9 +177,19 @@ function classifyReport(text) {
     // "Prod Sum" (single 'm' — confirmed on Harbord's BombieFood/Hotel Food
     // Product Summary weekly exports).
     category = 'product_mix';
+  } else if (/manager.{0,10}stock\s*loss/.test(t)) {
+    // Checked before the plain "stock loss" match below — despite the name,
+    // Bepoz's "Manager Stockloss" export is a completely different report:
+    // it's a table/tab close-out list (comped manager & staff meals written
+    // off as a loss), not a product-level stock-loss transaction log. Real
+    // Harbord Hotel data confirms the two need separate parsers entirely.
+    category = 'table_writeoffs';
+  } else if (/bulk\s*beer/.test(t)) {
+    category = 'bulk_beer';
   } else if (/stock\s*loss/.test(t)) {
     // \s* (not a literal space) also matches "Stockloss" run together —
-    // confirmed on Harbord's "Manager Stockloss Last WK" export.
+    // confirmed on Harbord's "Manager Stockloss Last WK" export (though
+    // that's now caught by the manager-specific check above first).
     category = 'stock_loss';
   } else if (/account\s*summ/.test(t)) {
     category = 'account_summary';
@@ -461,6 +471,148 @@ function parseWeeklyStaffSalesRows(workbook) {
       profitAmt: round2(r[7]),
       profitPct: round2(Number(r[8]) * 100),
       lastTrans: r[9] ? String(r[9]) : '',
+    });
+  }
+  return out;
+}
+
+// Bepoz's Stock Loss transaction log has one "header" row per loss event
+// (Till/Operator/Comment, with the $ value in the "Transaction Total"
+// column) followed by zero or more "product" sub-rows for the same
+// transaction, which record Bepoz's own increment/decrement UI history for
+// that event (e.g. qty 1, -1, 2, -2, 3... as someone adjusts the entry) —
+// confirmed on real Harbord Hotel data these oscillate and do NOT net to a
+// meaningful per-product quantity, so they're deliberately not used here.
+// The header row's Transaction Total sums exactly to the report's own
+// "Totals:" row Nett figure (verified to the cent on two real weeks), so
+// it's the reliable per-event $ figure — grouped by Till and listed as the
+// biggest individual events, which is the level a manager can actually act
+// on (a keg that keeps going flat on Main Bar 1, a specific big write-off).
+function parseStockLossRows(workbook) {
+  const sheet = findDataSheet(workbook);
+  if (!sheet) return null;
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+  if (rows.length < 2) return null;
+  const header = (rows[0] || []).map(h => String(h || '').replace(/\s+/g, ' ').trim().toLowerCase());
+  if (!header[0].startsWith('date') || !header[3].startsWith('till')) return null; // unexpected layout
+
+  const events = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (r[6]) continue; // product sub-row (Bepoz's UI adjustment history) — skip
+    const transId = r[1];
+    if (!transId || typeof transId !== 'number') continue; // "Totals:" row or blank
+    const amount = round2(r[5]);
+    events.push({
+      date: r[0] ? String(r[0]) : '',
+      till: (r[3] || '').toString().trim() || 'Unknown till',
+      operator: (r[4] || '').toString().trim(),
+      amount,
+      comment: (r[12] || '').toString().trim(),
+    });
+  }
+  if (!events.length) return null;
+
+  const total = round2(events.reduce((s, e) => s + e.amount, 0));
+  const byTillMap = new Map();
+  events.forEach(e => {
+    const cur = byTillMap.get(e.till) || { till: e.till, amount: 0, count: 0 };
+    cur.amount += e.amount;
+    cur.count++;
+    byTillMap.set(e.till, cur);
+  });
+  const byTill = Array.from(byTillMap.values())
+    .map(t => ({ ...t, amount: round2(t.amount) }))
+    .sort((a, b) => b.amount - a.amount);
+  const topEvents = events.slice().sort((a, b) => b.amount - a.amount).slice(0, 8);
+
+  return { total, count: events.length, byTill, topEvents };
+}
+
+// Bepoz's "Manager Stockloss" export, despite the name, is a table/tab
+// close-out list — every table tab closed with an unpaid balance written
+// off as a loss (confirmed on real Harbord Hotel data: almost entirely
+// comped manager/staff meals, free-text "Name" field like "MANAGERS MEALS",
+// "STAFFY", with a lot of inconsistent spelling/typos). Individual reasons
+// are too free-text to group exactly, so they're bucketed into Manager
+// Meals / Staff Meals / Other by keyword, which the real data shows covers
+// the large majority cleanly.
+function classifyWriteoffReason(name) {
+  const n = (name || '').toLowerCase();
+  if (/manager/.test(n) || /\bman\b/.test(n)) return 'Manager meals';
+  if (/staff/.test(n)) return 'Staff meals';
+  return 'Other';
+}
+function parseTableWriteoffRows(workbook) {
+  const sheet = findDataSheet(workbook);
+  if (!sheet) return null;
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+  if (rows.length < 2) return null;
+  const header = (rows[0] || []).map(h => String(h || '').replace(/\s+/g, ' ').trim().toLowerCase());
+  if (!header[1].startsWith('table number') && !header[1].startsWith('table')) return null; // unexpected layout
+
+  const events = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (r[1] === 'Totals:') continue;
+    const losses = Number(r[8]);
+    if (!Number.isFinite(losses) || losses === 0) continue; // no write-off on this table
+    const rawName = (r[10] || '').toString().trim();
+    events.push({
+      tableNumber: (r[1] || '').toString().trim(),
+      dateOpened: r[2] ? String(r[2]) : '',
+      amount: round2(losses),
+      name: rawName || 'Unnamed',
+      reason: classifyWriteoffReason(rawName),
+      tableGroup: (r[14] || '').toString().trim() || 'Unknown',
+    });
+  }
+  if (!events.length) return null;
+
+  const total = round2(events.reduce((s, e) => s + e.amount, 0));
+  const byReasonMap = new Map();
+  events.forEach(e => {
+    const cur = byReasonMap.get(e.reason) || { reason: e.reason, amount: 0, count: 0 };
+    cur.amount += e.amount;
+    cur.count++;
+    byReasonMap.set(e.reason, cur);
+  });
+  const byReason = Array.from(byReasonMap.values())
+    .map(r => ({ ...r, amount: round2(r.amount) }))
+    .sort((a, b) => b.amount - a.amount);
+  const topEvents = events.slice().sort((a, b) => b.amount - a.amount).slice(0, 8);
+
+  return { total, count: events.length, byReason, topEvents };
+}
+
+// Bulk Beer Litres: a straightforward per-product report (revenue, cost,
+// litres sold, supplier) — same shape family as parseWeeklyProductRows but
+// with its own column layout (no Size/qty-transaction columns, litres
+// instead).
+function parseBulkBeerRows(workbook) {
+  const sheet = findDataSheet(workbook);
+  if (!sheet) return null;
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+  if (rows.length < 2) return null;
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const rawName = r[0];
+    if (typeof rawName !== 'string' || !rawName.trim() || /^totals?\s*:/i.test(rawName)) continue;
+    const litresSold = Number(r[5]);
+    if (!Number.isFinite(litresSold)) continue;
+    const name = cleanLeakedName(rawName.trim());
+    if (name === null) continue;
+    const nettTotal = round2(r[3]);
+    const costEx = round2(r[4]);
+    out.push({
+      name,
+      litresSold: round2(litresSold),
+      nettTotal,
+      costEx,
+      profitAmt: round2(nettTotal - costEx),
+      profitPct: nettTotal > 0 ? round2((nettTotal - costEx) / nettTotal * 100) : 0,
+      supplier: (r[6] || '').toString().trim(),
     });
   }
   return out;
@@ -930,6 +1082,116 @@ function productMixHTML(entries, storeLabel) {
   </div>`;
 }
 
+function weekTrendHTML(current, previous, label) {
+  if (previous === undefined || previous === null || previous === 0) return '';
+  const pct = (current - previous) / previous * 100;
+  if (Math.abs(pct) < 1) return '';
+  const dir = pct > 0 ? 'up' : 'down';
+  return ` <span class="powered-by">${dir} ${Math.abs(pct).toFixed(0)}% vs prior week's ${cur(previous)} ${label}</span>`;
+}
+
+function stockLossHTML(entries) {
+  if (!entries.length) return '';
+  const sorted = entries.slice().sort((a, b) => b.weekEnd - a.weekEnd);
+  const week = sorted[0];
+  const prior = sorted[1];
+  const d = week.data;
+
+  const tillRows = d.byTill.map(t => `
+    <tr>
+      <td>${t.till}</td>
+      <td class="num">${t.count}</td>
+      <td class="num">${cur(t.amount)}</td>
+    </tr>`).join('');
+
+  const eventRows = d.topEvents.map(e => `
+    <tr>
+      <td>${e.date.slice(0, 10)}</td>
+      <td>${e.till}</td>
+      <td>${e.comment || '—'}</td>
+      <td class="num">${cur(e.amount)}</td>
+    </tr>`).join('');
+
+  return `<div class="result-card">
+    <div class="card-label">Stock loss — week of ${weekLabel(week)}${entries.length > 1 ? ` <span class="powered-by">${entries.length} weeks uploaded, showing latest</span>` : ''}</div>
+    <div class="metric-value">${cur(d.total)}</div>
+    <div class="metric-sub">${d.count} loss event${d.count === 1 ? '' : 's'} across ${d.byTill.length} till${d.byTill.length === 1 ? '' : 's'}${prior ? weekTrendHTML(d.total, prior.data.total, 'total') : ''}</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Till</th><th class="num">Events</th><th class="num">$ lost</th></tr></thead>
+      <tbody>${tillRows}</tbody>
+    </table></div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Date</th><th>Till</th><th>Reason</th><th class="num">$ lost</th></tr></thead>
+      <tbody>${eventRows}</tbody>
+    </table></div>
+  </div>`;
+}
+
+function tableWriteoffsHTML(entries) {
+  if (!entries.length) return '';
+  const sorted = entries.slice().sort((a, b) => b.weekEnd - a.weekEnd);
+  const week = sorted[0];
+  const prior = sorted[1];
+  const d = week.data;
+
+  const reasonRows = d.byReason.map(r => `
+    <tr>
+      <td>${r.reason}</td>
+      <td class="num">${r.count}</td>
+      <td class="num">${cur(r.amount)}</td>
+    </tr>`).join('');
+
+  const eventRows = d.topEvents.map(e => `
+    <tr>
+      <td>${e.dateOpened.slice(0, 10)}</td>
+      <td>${e.tableNumber}</td>
+      <td>${e.name}</td>
+      <td class="num">${cur(e.amount)}</td>
+    </tr>`).join('');
+
+  return `<div class="result-card">
+    <div class="card-label">Comps &amp; write-offs — week of ${weekLabel(week)}${entries.length > 1 ? ` <span class="powered-by">${entries.length} weeks uploaded, showing latest</span>` : ''}</div>
+    <div class="metric-value">${cur(d.total)}</div>
+    <div class="metric-sub">${d.count} table${d.count === 1 ? '' : 's'} written off${prior ? weekTrendHTML(d.total, prior.data.total, 'total') : ''}</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Reason</th><th class="num">Tables</th><th class="num">$ written off</th></tr></thead>
+      <tbody>${reasonRows}</tbody>
+    </table></div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Date</th><th>Table</th><th>Name / note</th><th class="num">$ written off</th></tr></thead>
+      <tbody>${eventRows}</tbody>
+    </table></div>
+  </div>`;
+}
+
+function bulkBeerHTML(entries) {
+  if (!entries.length) return '';
+  const week = latestWeek(entries);
+  const rows = week.rows.slice().sort((a, b) => b.litresSold - a.litresSold).slice(0, 12);
+  const totalLitres = week.rows.reduce((s, r) => s + r.litresSold, 0);
+  const totalNett = week.rows.reduce((s, r) => s + r.nettTotal, 0);
+  const totalCost = week.rows.reduce((s, r) => s + r.costEx, 0);
+  const overallMargin = totalNett > 0 ? (totalNett - totalCost) / totalNett * 100 : 0;
+
+  const tableRows = rows.map(r => `
+    <tr>
+      <td>${r.name}</td>
+      <td class="num">${r.litresSold.toFixed(1)}L</td>
+      <td class="num">${cur(r.nettTotal)}</td>
+      <td class="num">${r.profitPct.toFixed(0)}%</td>
+    </tr>`).join('');
+
+  return `<div class="result-card">
+    <div class="card-label">Bulk beer — week of ${weekLabel(week)}${entries.length > 1 ? ` <span class="powered-by">${entries.length} weeks uploaded, showing latest</span>` : ''}</div>
+    <div class="metric-value">${totalLitres.toFixed(0)}L</div>
+    <div class="metric-sub">${cur(totalNett)} nett · ${overallMargin.toFixed(0)}% blended margin</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Product</th><th class="num">Litres sold</th><th class="num">Nett sales</th><th class="num">Margin</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+  </div>`;
+}
+
 /* ── Weekly ops totals (aggregated across every uploaded week) ─────────────── */
 function weekRangeLabel(entries) {
   const sorted = entries.slice().sort((a, b) => a.weekStart - b.weekStart);
@@ -1136,7 +1398,8 @@ Hourly pattern is based on ${headlineLabel}:
 
   let weeklySection = '';
   const productMixStoreKeys = weekly ? Object.keys(weekly.productMix || {}) : [];
-  if (weekly && (weekly.staffSales.length || weekly.cogs.length || productMixStoreKeys.length)) {
+  if (weekly && (weekly.staffSales.length || weekly.cogs.length || productMixStoreKeys.length
+      || weekly.stockLoss.length || weekly.tableWriteoffs.length || weekly.bulkBeer.length)) {
     const parts = [];
     if (weekly.staffSales.length) {
       const w = latestWeek(weekly.staffSales);
@@ -1181,6 +1444,26 @@ Hourly pattern is based on ${headlineLabel}:
           totals.map(r => `- ${r.name}: ${cur(r.nettTotal)} total (avg ${cur(r.nettTotal / weeks)}/week, ${r.qty} sold, ${blendedProfitPct(r).toFixed(0)}% blended margin)`).join('\n'));
       }
     });
+    if (weekly.stockLoss.length) {
+      const w = latestWeek(weekly.stockLoss);
+      const d = w.data;
+      parts.push(`Stock loss, week of ${weekLabel(w)}: ${cur(d.total)} across ${d.count} loss events — by till:\n` +
+        d.byTill.slice(0, 6).map(t => `- ${t.till}: ${cur(t.amount)} (${t.count} events)`).join('\n'));
+    }
+    if (weekly.tableWriteoffs.length) {
+      const w = latestWeek(weekly.tableWriteoffs);
+      const d = w.data;
+      parts.push(`Comps & write-offs, week of ${weekLabel(w)}: ${cur(d.total)} across ${d.count} tables — by reason:\n` +
+        d.byReason.map(r => `- ${r.reason}: ${cur(r.amount)} (${r.count} tables)`).join('\n'));
+    }
+    if (weekly.bulkBeer.length) {
+      const w = latestWeek(weekly.bulkBeer);
+      const totalLitres = w.rows.reduce((s, r) => s + r.litresSold, 0);
+      const totalNett = w.rows.reduce((s, r) => s + r.nettTotal, 0);
+      const top = w.rows.slice().sort((a, b) => b.litresSold - a.litresSold).slice(0, 6);
+      parts.push(`Bulk beer, week of ${weekLabel(w)}: ${totalLitres.toFixed(0)}L sold, ${cur(totalNett)} nett — top by litres:\n` +
+        top.map(r => `- ${r.name}: ${r.litresSold.toFixed(0)}L, ${cur(r.nettTotal)}, ${r.profitPct.toFixed(0)}% margin`).join('\n'));
+    }
     weeklySection = `\n\nWeekly performance data:\n${parts.join('\n\n')}`;
   }
 
@@ -1313,7 +1596,7 @@ async function runAnalysis() {
     // were five different WEEKS of one report — wrong "N weeks uploaded"
     // label, only one store's data ever shown, and multi-week totals that
     // silently sum different stores together as if summing weeks.
-    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {} }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0 };
+    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {}, stockLoss: [], tableWriteoffs: [], bulkBeer: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0 };
     const v = venues[vKey];
 
     if (info.category === 'period_summary') {
@@ -1333,12 +1616,47 @@ async function runAnalysis() {
       continue;
     }
 
-    if (info.category === 'stock_loss' || info.category === 'account_summary' || info.category === 'unsupported_weekly') {
+    if (info.category === 'account_summary' || info.category === 'unsupported_weekly') {
       // Recognised so they don't show up as parse failures, but no UI built
-      // for them yet — covers known-but-unbuilt weekly report types (Stock
-      // Loss, Account Summary) as well as any weekly-shaped report that
-      // doesn't match a known sub-type at all (e.g. Bulk Beer Litres).
+      // for them yet — Account Summary, plus any weekly-shaped report that
+      // doesn't match a known sub-type at all.
       v.unsupportedWeeklyCount++;
+      continue;
+    }
+
+    if (info.category === 'stock_loss' || info.category === 'table_writeoffs' || info.category === 'bulk_beer') {
+      const range = extractShiftDateRange(text);
+      if (!range) {
+        failed++;
+        failureSamples.push(`${f.name}: recognised as "${info.title}" but no week date range found`);
+        continue;
+      }
+      if (!xlsxWorkbook) {
+        // No PDF exemplar seen for these three report types yet — only the
+        // XLSX workbook-reading parsers exist.
+        v.unsupportedWeeklyCount++;
+        continue;
+      }
+      if (info.category === 'bulk_beer') {
+        const rows = parseBulkBeerRows(xlsxWorkbook);
+        if (!rows || !rows.length) {
+          failed++;
+          failureSamples.push(`${f.name}: recognised as "${info.title}" but couldn't parse any rows`);
+          continue;
+        }
+        v.weekly.bulkBeer.push({ weekStart: range.from, weekEnd: range.to, rows });
+        parsed++;
+        continue;
+      }
+      const data = info.category === 'stock_loss' ? parseStockLossRows(xlsxWorkbook) : parseTableWriteoffRows(xlsxWorkbook);
+      if (!data) {
+        failed++;
+        failureSamples.push(`${f.name}: recognised as "${info.title}" but couldn't parse any rows`);
+        continue;
+      }
+      const bucket = info.category === 'stock_loss' ? v.weekly.stockLoss : v.weekly.tableWriteoffs;
+      bucket.push({ weekStart: range.from, weekEnd: range.to, data });
+      parsed++;
       continue;
     }
 
@@ -1462,7 +1780,8 @@ async function runAnalysis() {
       .filter(c => c.stats);
 
     const productMixStores = Object.keys(v.weekly.productMix);
-    const hasWeekly = v.weekly.staffSales.length || v.weekly.cogs.length || productMixStores.length;
+    const hasWeekly = v.weekly.staffSales.length || v.weekly.cogs.length || productMixStores.length
+      || v.weekly.stockLoss.length || v.weekly.tableWriteoffs.length || v.weekly.bulkBeer.length;
 
     const metricsHTML = catStats.length ? catStats.map(c => `
       <div class="metric-card">
@@ -1524,7 +1843,10 @@ async function runAnalysis() {
       ${staffTotalsHTML(v.weekly.staffSales)}
       ${cogsHTML(v.weekly.cogs)}
       ${cogsTotalsHTML(v.weekly.cogs)}
-      ${productMixSection}` : '';
+      ${productMixSection}
+      ${stockLossHTML(v.weekly.stockLoss)}
+      ${tableWriteoffsHTML(v.weekly.tableWriteoffs)}
+      ${bulkBeerHTML(v.weekly.bulkBeer)}` : '';
 
     const periodSummaryList = Object.values(v.periodSummary || {});
     const hasPeriodSummary = periodSummaryList.length > 0;
@@ -1537,7 +1859,7 @@ async function runAnalysis() {
     section.innerHTML = `
       <div class="venue-header">
         <h3>${venueName}</h3>
-        <p class="results-meta">${dateRange}${v.periodSummaryCount ? ` · ${v.periodSummaryCount} period summary file${v.periodSummaryCount === 1 ? '' : 's'} not charted` : ''}${v.unsupportedWeeklyCount ? ` · ${v.unsupportedWeeklyCount} weekly report file${v.unsupportedWeeklyCount === 1 ? '' : 's'} recognised but not charted yet (stock loss, account summary, or another type without a dashboard yet)` : ''}</p>
+        <p class="results-meta">${dateRange}${v.periodSummaryCount ? ` · ${v.periodSummaryCount} period summary file${v.periodSummaryCount === 1 ? '' : 's'} not charted` : ''}${v.unsupportedWeeklyCount ? ` · ${v.unsupportedWeeklyCount} weekly report file${v.unsupportedWeeklyCount === 1 ? '' : 's'} recognised but not charted yet (account summary, or another type without a dashboard yet)` : ''}</p>
       </div>
       <div class="metrics-grid">${metricsHTML}</div>
       ${subVenueList.length ? `<div class="result-card"><div class="card-label">Sub-venues / satellite bars</div><div class="metrics-grid">${subVenueHTML}</div></div>` : ''}
