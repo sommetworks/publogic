@@ -346,6 +346,126 @@ function parseSizedRows(text) {
   return rows;
 }
 
+function round2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+// parseStaffSalesRows/parseSizedRows above read the flattened, regex-matched
+// text — which works for PDF weekly reports because Bepoz's PDF renderer
+// always prints every figure pre-formatted ("$1,204.70", "67.34%"). Bepoz's
+// weekly XLSX exports do NOT do this for individual line-item rows: only
+// the per-category/grand "Totals:" rows carry formatted display strings —
+// every individual product or staff row is a raw, unformatted number (and
+// sometimes a floating-point artifact like 7.1e-15 instead of an exact
+// zero), confirmed on all of Harbord Hotel's real weekly XLSX exports. The
+// text-regex parsers can't match those rows at all (no "$"/"%" to anchor
+// on), and their open-ended name capture can wander across several
+// unrelated rows looking for one, producing exactly the garbled
+// concatenated-row output seen in production. These read the workbook's
+// cells directly instead, by column position, whenever one is available.
+function findDataSheet(workbook) {
+  if (!workbook) return null;
+  const name = workbook.SheetNames.find(n => !/^criteria/i.test(n) && n !== 'ValueList_Helper');
+  return name ? workbook.Sheets[name] : null;
+}
+
+// Bepoz ships weekly Product Summary XLSX exports in two different column
+// layouts, confirmed on real Harbord Hotel data — same report family, but
+// the "...Food Prod Sum..." variant (BombieFood, Hotel Food) drops the
+// Size column and the %-of-Nett column entirely in favour of Gross and GST
+// Total, while the "Prod Summ Weekly ..." variant (Bombies/Bshop/Hotel) has
+// them. Detected from the header row rather than guessed from the filename.
+//   with Size:    Product Name / Size Name / Qty Units Sold / NettTotal /
+//                 % of NettTotal / CostEx of Sales / Profit Amt / Profit% /
+//                 CostInc of Sales — individual rows always say "All Sizes"
+//   without Size: Name / Units Sold / Gross / Nett Total / Costex of Sales /
+//                 ProfitAmt / Profit% / GST Total / (formula column)
+// costInc/pctOfNett aren't rendered anywhere downstream for these rows (only
+// name/qty/nettTotal/profitPct/costEx are), so the no-Size shape leaves them
+// at 0 rather than approximating a number nothing displays.
+function parseWeeklyProductRows(workbook) {
+  const sheet = findDataSheet(workbook);
+  if (!sheet) return null;
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+  if (!rows.length) return null;
+  const header = (rows[0] || []).map(h => String(h || '').replace(/\s+/g, ' ').trim().toLowerCase());
+  const hasSizeColumn = header.some(h => h === 'size name' || h === 'size');
+
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const rawName = r[0];
+    if (typeof rawName !== 'string' || !rawName.trim()) continue;
+    if (/^totals?\s*:/i.test(rawName) || /^type\s*:/i.test(rawName)) continue;
+
+    if (hasSizeColumn) {
+      if (r[1] !== 'All Sizes') continue; // per-type subtotal/category rows don't say "All Sizes"
+      const qty = Number(r[2]);
+      if (!Number.isFinite(qty)) continue;
+      const name = cleanLeakedName(rawName.trim());
+      if (name === null) continue;
+      out.push({
+        name,
+        qty,
+        nettTotal: round2(r[3]),
+        pctOfNett: round2(Number(r[4]) * 100),
+        costEx: round2(r[5]),
+        profitAmt: round2(r[6]),
+        profitPct: round2(Number(r[7]) * 100),
+        costInc: round2(r[8]),
+      });
+    } else {
+      const qty = Number(r[1]);
+      if (!Number.isFinite(qty)) continue;
+      const name = cleanLeakedName(rawName.trim());
+      if (name === null) continue;
+      out.push({
+        name,
+        qty,
+        nettTotal: round2(r[3]),
+        pctOfNett: 0,
+        costEx: round2(r[4]),
+        profitAmt: round2(r[5]),
+        profitPct: round2(Number(r[6]) * 100),
+        costInc: 0,
+      });
+    }
+  }
+  return out;
+}
+
+// Shape: Name/QtyTransactions/GrossSales/TotalDiscount/NettTotal/
+// %ofNettTotal/CostOfSales/ProfitAmt/Profit%/DateTimeLastTrans.
+function parseWeeklyStaffSalesRows(workbook) {
+  const sheet = findDataSheet(workbook);
+  if (!sheet) return null;
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const rawName = r[0];
+    if (typeof rawName !== 'string' || !rawName.trim()) continue;
+    if (/^totals?\s*:/i.test(rawName)) continue;
+    const transactions = Number(r[1]);
+    if (!Number.isFinite(transactions)) continue;
+    const name = cleanLeakedName(rawName.trim());
+    if (name === null) continue;
+    out.push({
+      name,
+      transactions,
+      grossSales: round2(r[2]),
+      discount: round2(r[3]),
+      nettTotal: round2(r[4]),
+      pctOfNett: round2(Number(r[5]) * 100),
+      costOfSales: round2(r[6]),
+      profitAmt: round2(r[7]),
+      profitPct: round2(Number(r[8]) * 100),
+      lastTrans: r[9] ? String(r[9]) : '',
+    });
+  }
+  return out;
+}
+
 /* ── Daily Period Summary parsing ────────────────────────────────────────── */
 // Bepoz's Period Summary export lays four independent tables (Stock, Sales,
 // Discount, Product Sortgroup) out side by side in one sheet. Flattening
@@ -773,11 +893,12 @@ function cogsHTML(entries) {
   </div>`;
 }
 
-function productMixHTML(entries) {
+function productMixHTML(entries, storeLabel) {
   if (!entries.length) return '';
   const week = latestWeek(entries);
   const rows = week.rows;
   const topSellers = rows.slice().sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 12);
+  const titleSuffix = storeLabel ? ` — ${storeLabel}` : '';
 
   // High-volume items (top 40 by qty) with weak margins — worth a pricing
   // look, as distinct from just-plain-slow sellers. $0-revenue rows are
@@ -800,7 +921,7 @@ function productMixHTML(entries) {
     : '';
 
   return `<div class="result-card">
-    <div class="card-label">Top sellers — week of ${weekLabel(week)}${entries.length > 1 ? ` <span class="powered-by">${entries.length} weeks uploaded, showing latest</span>` : ''}</div>
+    <div class="card-label">Top sellers${titleSuffix} — week of ${weekLabel(week)}${entries.length > 1 ? ` <span class="powered-by">${entries.length} weeks uploaded, showing latest</span>` : ''}</div>
     <div class="data-table-wrap"><table class="data-table">
       <thead><tr><th>Product</th><th class="num">Qty</th><th class="num">Nett sales</th><th class="num">Margin</th></tr></thead>
       <tbody>${sellerRows}</tbody>
@@ -884,11 +1005,12 @@ function cogsTotalsHTML(entries) {
   </div>`;
 }
 
-function productTotalsHTML(entries) {
+function productTotalsHTML(entries, storeLabel) {
   if (entries.length < 2) return '';
   const weeks = entries.length;
   const rows = aggregateRows(entries, ['qty']);
   const topSellers = rows.slice().sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 12);
+  const titleSuffix = storeLabel ? ` — ${storeLabel}` : '';
 
   const tableRows = topSellers.map(r => `
     <tr>
@@ -900,7 +1022,7 @@ function productTotalsHTML(entries) {
     </tr>`).join('');
 
   return `<div class="result-card">
-    <div class="card-label">Top sellers — ${weeks}-week total (${weekRangeLabel(entries)})</div>
+    <div class="card-label">Top sellers${titleSuffix} — ${weeks}-week total (${weekRangeLabel(entries)})</div>
     <div class="data-table-wrap"><table class="data-table">
       <thead><tr><th>Product</th><th class="num">Total qty</th><th class="num">Total nett</th><th class="num">Avg/week</th><th class="num">Margin</th></tr></thead>
       <tbody>${tableRows}</tbody>
@@ -1013,7 +1135,8 @@ Hourly pattern is based on ${headlineLabel}:
   }
 
   let weeklySection = '';
-  if (weekly && (weekly.staffSales.length || weekly.cogs.length || weekly.productMix.length)) {
+  const productMixStoreKeys = weekly ? Object.keys(weekly.productMix || {}) : [];
+  if (weekly && (weekly.staffSales.length || weekly.cogs.length || productMixStoreKeys.length)) {
     const parts = [];
     if (weekly.staffSales.length) {
       const w = latestWeek(weekly.staffSales);
@@ -1040,18 +1163,24 @@ Hourly pattern is based on ${headlineLabel}:
           totals.map(r => `- ${r.name}: ${cur(r.nettTotal)} total nett (avg ${cur(r.nettTotal / weeks)}/week), ${blendedProfitPct(r).toFixed(0)}% blended margin`).join('\n'));
       }
     }
-    if (weekly.productMix.length) {
-      const w = latestWeek(weekly.productMix);
+    // productMix is keyed by store (see runAnalysis) — one store's report
+    // per label, so multiple stores' weekly uploads for the same period
+    // never get summed together as if they were multiple weeks of one
+    // report.
+    productMixStoreKeys.forEach(storeKey => {
+      const entries = weekly.productMix[storeKey];
+      const storeLabel = productMixStoreKeys.length > 1 ? ` — ${storeKey}` : '';
+      const w = latestWeek(entries);
       const top = w.rows.slice().sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 8);
-      parts.push(`Top-selling products, week of ${weekLabel(w)}:\n` +
+      parts.push(`Top-selling products${storeLabel}, week of ${weekLabel(w)}:\n` +
         top.map(r => `- ${r.name}: ${cur(r.nettTotal)} (${r.qty} sold, ${r.profitPct.toFixed(0)}% margin)`).join('\n'));
-      if (weekly.productMix.length > 1) {
-        const weeks = weekly.productMix.length;
-        const totals = aggregateRows(weekly.productMix, ['qty']).sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 8);
-        parts.push(`Top-selling products, ${weeks}-week total (${weekRangeLabel(weekly.productMix)}):\n` +
+      if (entries.length > 1) {
+        const weeks = entries.length;
+        const totals = aggregateRows(entries, ['qty']).sort((a, b) => b.nettTotal - a.nettTotal).slice(0, 8);
+        parts.push(`Top-selling products${storeLabel}, ${weeks}-week total (${weekRangeLabel(entries)}):\n` +
           totals.map(r => `- ${r.name}: ${cur(r.nettTotal)} total (avg ${cur(r.nettTotal / weeks)}/week, ${r.qty} sold, ${blendedProfitPct(r).toFixed(0)}% blended margin)`).join('\n'));
       }
-    }
+    });
     weeklySection = `\n\nWeekly performance data:\n${parts.join('\n\n')}`;
   }
 
@@ -1177,7 +1306,14 @@ async function runAnalysis() {
     }
 
     const vKey = resolveVenueKey(venues, info.venue);
-    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0 };
+    // productMix is keyed by store (not a flat array like staffSales/cogs) —
+    // Harbord Hotel's weekly Product Summary is exported as one file PER
+    // STORE (Bombies/Bottleshop/Hotel/...), all landing in the same week, so
+    // a flat array would treat five different stores' reports as if they
+    // were five different WEEKS of one report — wrong "N weeks uploaded"
+    // label, only one store's data ever shown, and multi-week totals that
+    // silently sum different stores together as if summing weeks.
+    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {} }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0 };
     const v = venues[vKey];
 
     if (info.category === 'period_summary') {
@@ -1213,15 +1349,44 @@ async function runAnalysis() {
         failureSamples.push(`${f.name}: recognised as "${info.title}" but no week date range found`);
         continue;
       }
-      const rows = info.category === 'staff_sales' ? parseStaffSalesRows(text) : parseSizedRows(text);
-      if (!rows.length) {
+      // Prefer reading the workbook's cells directly for XLSX weekly reports
+      // — Bepoz's individual product/staff rows there are raw unformatted
+      // numbers, not "$X.XX" display strings, which the text-regex parsers
+      // below can't reliably match (see parseWeeklyProductRows' comment).
+      // Falls back to the text-regex parsers for PDF weekly reports, which
+      // Bepoz always renders with formatted figures.
+      let rows;
+      if (xlsxWorkbook) {
+        rows = info.category === 'staff_sales' ? parseWeeklyStaffSalesRows(xlsxWorkbook) : parseWeeklyProductRows(xlsxWorkbook);
+      } else {
+        rows = info.category === 'staff_sales' ? parseStaffSalesRows(text) : parseSizedRows(text);
+      }
+      if (!rows || !rows.length) {
         failed++;
         failureSamples.push(`${f.name}: recognised as "${info.title}" but couldn't parse any rows`);
         continue;
       }
-      const bucket = info.category === 'staff_sales' ? v.weekly.staffSales
-                   : info.category === 'cogs' ? v.weekly.cogs : v.weekly.productMix;
-      bucket.push({ weekStart: range.from, weekEnd: range.to, rows });
+      const entry = { weekStart: range.from, weekEnd: range.to, rows };
+      if (info.category === 'staff_sales') {
+        v.weekly.staffSales.push(entry);
+      } else if (info.category === 'cogs') {
+        v.weekly.cogs.push(entry);
+      } else {
+        // A store can have more than one weekly Product Summary report
+        // family — Harbord Hotel runs a "Food" product summary (different
+        // column layout entirely, see parseWeeklyProductRows) alongside its
+        // general Product Summary for the same store (e.g. "HH BombieFood
+        // Prod Sum" and "HH Prod Summ Weekly Bombies" are both for "HH
+        // Bombies"). Keying on store alone would bucket those two distinct
+        // report series together and mislabel them as two different WEEKS
+        // of the same report — the same conflation bug this store-keying
+        // was built to avoid, one level down. Tagged onto the key using the
+        // same "food" signal classifyReport already uses for daily reports.
+        const store = (info.store || info.venue || 'All Stores').trim();
+        const storeKey = /food/i.test(info.title) ? `${store} (Food)` : store;
+        v.weekly.productMix[storeKey] = v.weekly.productMix[storeKey] || [];
+        v.weekly.productMix[storeKey].push(entry);
+      }
       parsed++;
       continue;
     }
@@ -1296,7 +1461,8 @@ async function runAnalysis() {
       .map(key => ({ key, stats: computeStats(v.categories[key].byDate) }))
       .filter(c => c.stats);
 
-    const hasWeekly = v.weekly.staffSales.length || v.weekly.cogs.length || v.weekly.productMix.length;
+    const productMixStores = Object.keys(v.weekly.productMix);
+    const hasWeekly = v.weekly.staffSales.length || v.weekly.cogs.length || productMixStores.length;
 
     const metricsHTML = catStats.length ? catStats.map(c => `
       <div class="metric-card">
@@ -1344,13 +1510,21 @@ async function runAnalysis() {
       ? `${fmtDate(allDays.reduce((a, b) => a.date < b.date ? a : b).date)} – ${fmtDate(allDays.reduce((a, b) => a.date > b.date ? a : b).date)}`
       : '';
 
+    // Product Mix is keyed by store — one card pair per store that actually
+    // uploaded a weekly report, labelled only when there's more than one
+    // (a single-store venue's cards read the same as before this change).
+    const productMixSection = productMixStores.map(storeKey => {
+      const entries = v.weekly.productMix[storeKey];
+      const label = productMixStores.length > 1 ? storeKey : null;
+      return productMixHTML(entries, label) + productTotalsHTML(entries, label);
+    }).join('');
+
     const weeklySection = hasWeekly ? `
       ${staffLeaderboardHTML(v.weekly.staffSales)}
       ${staffTotalsHTML(v.weekly.staffSales)}
       ${cogsHTML(v.weekly.cogs)}
       ${cogsTotalsHTML(v.weekly.cogs)}
-      ${productMixHTML(v.weekly.productMix)}
-      ${productTotalsHTML(v.weekly.productMix)}` : '';
+      ${productMixSection}` : '';
 
     const periodSummaryList = Object.values(v.periodSummary || {});
     const hasPeriodSummary = periodSummaryList.length > 0;
