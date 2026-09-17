@@ -618,6 +618,87 @@ function parseBulkBeerRows(workbook) {
   return out;
 }
 
+/* ── Staff Roster (generic template) ─────────────────────────────────────── */
+// Not a Bepoz export at all — a plain staff list (role/department/hours)
+// the operator maintains themselves, or eventually a direct FoundU export
+// mapped onto this same shape. Detected from its own header row rather than
+// Bepoz's Venue:/Store: Criteria-sheet model, which a roster file has no
+// reason to follow. Joined onto the weekly Staff Sales leaderboard by name
+// (case-insensitive) at render time — see matchRosterEntry() below — rather
+// than folded into a venue while files are still being read, since a
+// roster's usefulness doesn't depend on which venue(s) it's read alongside.
+const ROSTER_HEADER_ALIASES = {
+  name: ['name', 'staff name', 'employee name', 'employee'],
+  role: ['role', 'position', 'job title', 'job role'],
+  department: ['department', 'dept', 'store', 'area', 'section'],
+  hours: ['hours', 'hours worked', 'hours this week', 'total hours', 'hrs', 'hrs worked'],
+  venue: ['venue', 'site', 'location'],
+};
+
+// Requires a Name column PLUS at least one of Role/Department/Hours — a bare
+// "Name" column alone (e.g. the weekly Staff Sales report's own header) is
+// too generic to safely claim as a roster file.
+function detectRosterSheet(workbook) {
+  if (!workbook) return null;
+  for (const sheetName of workbook.SheetNames) {
+    if (/^criteria/i.test(sheetName) || sheetName === 'ValueList_Helper') continue;
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: '', raw: true });
+    if (!rows.length) continue;
+    const header = (rows[0] || []).map(h => String(h || '').replace(/\s+/g, ' ').trim().toLowerCase());
+    const findCol = aliases => header.findIndex(h => aliases.includes(h));
+    const nameIdx = findCol(ROSTER_HEADER_ALIASES.name);
+    if (nameIdx < 0) continue;
+    const roleIdx = findCol(ROSTER_HEADER_ALIASES.role);
+    const deptIdx = findCol(ROSTER_HEADER_ALIASES.department);
+    const hoursIdx = findCol(ROSTER_HEADER_ALIASES.hours);
+    if (roleIdx < 0 && deptIdx < 0 && hoursIdx < 0) continue;
+    const venueIdx = findCol(ROSTER_HEADER_ALIASES.venue);
+    return { rows, nameIdx, roleIdx, deptIdx, hoursIdx, venueIdx };
+  }
+  return null;
+}
+
+function parseRosterRows(workbook) {
+  const sheet = detectRosterSheet(workbook);
+  if (!sheet) return null;
+  const { rows, nameIdx, roleIdx, deptIdx, hoursIdx, venueIdx } = sheet;
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const rawName = r[nameIdx];
+    if (typeof rawName !== 'string' || !rawName.trim()) continue;
+    const roleRaw = roleIdx >= 0 ? String(r[roleIdx] || '').trim() : '';
+    const hoursRaw = hoursIdx >= 0 ? Number(r[hoursIdx]) : NaN;
+    out.push({
+      name: rawName.trim(),
+      role: roleRaw || 'Staff',
+      // Blank department is meaningful, not missing data — it's how a
+      // Manager (or anyone who floats across departments rather than having
+      // one fixed one) is represented in this template.
+      department: deptIdx >= 0 ? String(r[deptIdx] || '').trim() : '',
+      hours: Number.isFinite(hoursRaw) && hoursRaw > 0 ? round2(hoursRaw) : null,
+      venue: venueIdx >= 0 ? String(r[venueIdx] || '').trim() : '',
+    });
+  }
+  return out;
+}
+
+// A name can appear more than once across roster rows — most operators will
+// only ever have one row per person, but a multi-venue upload might list the
+// same person twice with different Venue values. Prefer whichever entry's
+// Venue matches the venue being rendered, falling back to the first.
+function matchRosterEntry(rosterByName, name, venueName) {
+  const entries = rosterByName[String(name || '').toLowerCase().trim()];
+  if (!entries || !entries.length) return null;
+  if (entries.length === 1) return entries[0];
+  const vn = String(venueName || '').toLowerCase();
+  return entries.find(e => e.venue && vn.includes(e.venue.toLowerCase())) || entries[0];
+}
+
+function isManagerRole(role) {
+  return /manager|supervisor|duty mgr/i.test(role || '');
+}
+
 /* ── Daily Period Summary parsing ────────────────────────────────────────── */
 // Bepoz's Period Summary export lays four independent tables (Stock, Sales,
 // Discount, Product Sortgroup) out side by side in one sheet. Flattening
@@ -985,15 +1066,22 @@ function latestWeek(entries) {
   return entries.slice().sort((a, b) => b.weekEnd - a.weekEnd)[0];
 }
 
-function staffLeaderboardHTML(entries) {
+function staffLeaderboardHTML(entries, rosterByName = {}, venueName = '') {
   if (!entries.length) return '';
   const week = latestWeek(entries);
   const rows = week.rows.slice().sort((a, b) => b.nettTotal - a.nettTotal);
   const avgProfitPct = rows.reduce((s, r) => s + r.profitPct, 0) / rows.length;
 
-  const tableRows = rows.map(r => `
+  // Role/Department columns only appear once a roster file has actually been
+  // joined to at least one name this week — an all-dash pair of columns for
+  // every venue that hasn't uploaded one yet would just be visual noise.
+  const rosterTags = rows.map(r => matchRosterEntry(rosterByName, r.name, venueName));
+  const hasRoster = rosterTags.some(Boolean);
+
+  const tableRows = rows.map((r, i) => `
     <tr>
       <td>${r.name}</td>
+      ${hasRoster ? `<td>${rosterTags[i] ? rosterTags[i].role : '—'}</td><td>${rosterTags[i] ? (rosterTags[i].department || '—') : '—'}</td>` : ''}
       <td class="num">${r.transactions}</td>
       <td class="num">${cur(r.nettTotal)}</td>
       <td class="num">${r.profitPct.toFixed(0)}%</td>
@@ -1007,7 +1095,62 @@ function staffLeaderboardHTML(entries) {
   return `<div class="result-card">
     <div class="card-label">Staff performance — week of ${weekLabel(week)}${entries.length > 1 ? ` <span class="powered-by">${entries.length} weeks uploaded, showing latest</span>` : ''}</div>
     <div class="data-table-wrap"><table class="data-table">
-      <thead><tr><th>Name</th><th class="num">Txns</th><th class="num">Nett sales</th><th class="num">Profit %</th></tr></thead>
+      <thead><tr><th>Name</th>${hasRoster ? '<th>Role</th><th>Department</th>' : ''}<th class="num">Txns</th><th class="num">Nett sales</th><th class="num">Profit %</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+    ${flags}
+  </div>`;
+}
+
+// Revenue-per-labour-hour by department — only rendered once a roster file
+// with usable Hours has actually joined to at least one of this week's
+// leaderboard rows. Deliberately NOT a labour-cost-% metric (that needs pay
+// rates, which weren't part of the roster template by design).
+function staffProductivityHTML(entries, rosterByName = {}, venueName = '') {
+  if (!entries.length) return '';
+  const week = latestWeek(entries);
+  const rows = week.rows;
+  const joined = rows.map(r => ({ r, roster: matchRosterEntry(rosterByName, r.name, venueName) }));
+  const withHours = joined.filter(j => j.roster && j.roster.hours);
+  if (!withHours.length) return '';
+
+  const byDept = new Map();
+  withHours.forEach(({ r, roster }) => {
+    const dept = roster.department || (isManagerRole(roster.role) ? 'Management / floating' : 'Unassigned department');
+    const agg = byDept.get(dept) || { dept, revenue: 0, hours: 0 };
+    agg.revenue += r.nettTotal;
+    agg.hours += roster.hours;
+    byDept.set(dept, agg);
+  });
+  const deptRows = Array.from(byDept.values())
+    .map(d => ({ ...d, perHour: d.hours > 0 ? d.revenue / d.hours : 0 }))
+    .sort((a, b) => b.perHour - a.perHour);
+
+  const totalRevenue = withHours.reduce((s, { r }) => s + r.nettTotal, 0);
+  const totalHours = withHours.reduce((s, { roster }) => s + roster.hours, 0);
+  const overallPerHour = totalHours > 0 ? totalRevenue / totalHours : 0;
+
+  const tableRows = deptRows.map(d => `
+    <tr>
+      <td>${d.dept}</td>
+      <td class="num">${d.hours.toFixed(1)}</td>
+      <td class="num">${cur(d.revenue)}</td>
+      <td class="num">${cur(d.perHour)}</td>
+    </tr>`).join('');
+
+  const laggards = deptRows.filter(d => d.hours >= 4 && d.perHour < overallPerHour * 0.7);
+  const flags = laggards.length
+    ? `<div class="flag warn"><span class="flag-icon">⚠</span><span>${laggards.map(d => `<strong>${d.dept}</strong> (${cur(d.perHour)}/hour vs venue avg ${cur(overallPerHour)}/hour)`).join(', ')} — well below average revenue per labour hour, worth checking rostering against demand</span></div>`
+    : '';
+
+  const unmatched = rows.length - withHours.length;
+
+  return `<div class="result-card">
+    <div class="card-label">Revenue per labour hour — week of ${weekLabel(week)}${entries.length > 1 ? ` <span class="powered-by">${entries.length} weeks uploaded, showing latest</span>` : ''}</div>
+    <div class="metric-value">${cur(overallPerHour)}/hr</div>
+    <div class="metric-sub">${withHours.length} of ${rows.length} staff on the leaderboard matched to roster hours${unmatched ? ` · ${unmatched} not matched (add them to your roster file for a complete picture)` : ''}</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Department</th><th class="num">Hours</th><th class="num">Revenue</th><th class="num">Revenue / hour</th></tr></thead>
       <tbody>${tableRows}</tbody>
     </table></div>
     ${flags}
@@ -1364,7 +1507,7 @@ function discountBreakdownHTML(storeEntry) {
 }
 
 /* ── Venue narrative prompt ──────────────────────────────────────────────── */
-function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary) {
+function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary, rosterByName = {}) {
   const catLines = categoryStats.map(c =>
     `- ${CATEGORY_LABELS[c.key] || c.key}: total ${cur(c.stats.total)} over ${c.stats.days.length} days, daily avg ${cur(c.stats.avg)}`
   ).join('\n');
@@ -1406,12 +1549,36 @@ Hourly pattern is based on ${headlineLabel}:
       const rows = w.rows.slice().sort((a, b) => b.nettTotal - a.nettTotal);
       const avgProfitPct = rows.reduce((s, r) => s + r.profitPct, 0) / rows.length;
       parts.push(`Staff performance, week of ${weekLabel(w)} (team avg profit margin ${avgProfitPct.toFixed(0)}%):\n` +
-        rows.slice(0, 8).map(r => `- ${r.name}: ${cur(r.nettTotal)} nett across ${r.transactions} transactions, ${r.profitPct.toFixed(0)}% profit margin`).join('\n'));
+        rows.slice(0, 8).map(r => {
+          const roster = matchRosterEntry(rosterByName, r.name, venueName);
+          const tag = roster ? ` [${roster.role}${roster.department ? ', ' + roster.department : ''}]` : '';
+          return `- ${r.name}${tag}: ${cur(r.nettTotal)} nett across ${r.transactions} transactions, ${r.profitPct.toFixed(0)}% profit margin`;
+        }).join('\n'));
       if (weekly.staffSales.length > 1) {
         const weeks = weekly.staffSales.length;
         const totals = aggregateRows(weekly.staffSales, ['transactions']).sort((a, b) => b.nettTotal - a.nettTotal);
         parts.push(`Staff performance, ${weeks}-week total (${weekRangeLabel(weekly.staffSales)}):\n` +
           totals.slice(0, 8).map(r => `- ${r.name}: ${cur(r.nettTotal)} total nett (avg ${cur(r.nettTotal / weeks)}/week) across ${r.transactions} transactions, ${blendedProfitPct(r).toFixed(0)}% blended profit margin`).join('\n'));
+      }
+      // Revenue-per-labour-hour by department — only when a roster file with
+      // Hours has actually joined to this week's leaderboard. NOT a labour
+      // cost % (that needs pay rates, deliberately out of scope).
+      const withHours = rows.map(r => ({ r, roster: matchRosterEntry(rosterByName, r.name, venueName) }))
+        .filter(x => x.roster && x.roster.hours);
+      if (withHours.length) {
+        const byDept = new Map();
+        withHours.forEach(({ r, roster }) => {
+          const dept = roster.department || (isManagerRole(roster.role) ? 'Management / floating' : 'Unassigned department');
+          const agg = byDept.get(dept) || { dept, revenue: 0, hours: 0 };
+          agg.revenue += r.nettTotal;
+          agg.hours += roster.hours;
+          byDept.set(dept, agg);
+        });
+        const deptRows = Array.from(byDept.values())
+          .map(d => ({ ...d, perHour: d.hours > 0 ? d.revenue / d.hours : 0 }))
+          .sort((a, b) => b.perHour - a.perHour);
+        parts.push(`Revenue per labour hour by department, week of ${weekLabel(w)} (from the uploaded roster/hours file, ${withHours.length} of ${rows.length} staff matched):\n` +
+          deptRows.map(d => `- ${d.dept}: ${cur(d.perHour)}/hour (${cur(d.revenue)} nett over ${d.hours.toFixed(1)} hours)`).join('\n'));
       }
     }
     if (weekly.cogs.length) {
@@ -1500,7 +1667,7 @@ Hourly pattern is based on ${headlineLabel}:
   return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && (weeklySection || periodSummarySection) ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
 ${dailySection}${weeklySection}${periodSummarySection}
 
-Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, which discount reasons are giving away the most margin and whether that looks justified, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
+Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), which departments are getting the most/least revenue per labour hour and whether rostering matches demand, category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, which discount reasons are giving away the most margin and whether that looks justified, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
 }
 
 async function streamBrief(prompt, targetEl) {
@@ -1559,6 +1726,12 @@ async function runAnalysis() {
   const venues = {};
   let parsed = 0, failed = 0, periodSummarySkipped = 0;
   const failureSamples = [];
+  // name.toLowerCase() -> [{name,role,department,hours,venue}], built from
+  // any uploaded Staff Roster file(s) and joined onto Staff Sales by name at
+  // render time (see matchRosterEntry) — not scoped to a venue while files
+  // are still being read, since roster files carry no Bepoz Venue/Store info.
+  const rosterByName = {};
+  let rosterFilesParsed = 0;
 
   for (let i = 0; i < allFiles.length; i++) {
     const f = allFiles[i];
@@ -1573,12 +1746,28 @@ async function runAnalysis() {
       } else {
         const r = await extractXLSXText(f);
         text = r.text;
-        xlsxWorkbook = r.workbook; // only needed for parseDiscounts below
+        xlsxWorkbook = r.workbook; // needed for parseDiscounts below, and for roster detection
       }
     } catch (e) {
       failed++;
       failureSamples.push(`${f.name}: could not read file (${e.message})`);
       continue;
+    }
+
+    // Staff Roster files don't fit Bepoz's Venue:/Store: Criteria-sheet
+    // model at all, so they're detected and pulled out here — from the
+    // workbook's own header row — before classifyReport ever sees them.
+    if (xlsxWorkbook) {
+      const rosterRows = parseRosterRows(xlsxWorkbook);
+      if (rosterRows && rosterRows.length) {
+        rosterRows.forEach(row => {
+          const key = row.name.toLowerCase();
+          (rosterByName[key] = rosterByName[key] || []).push(row);
+        });
+        rosterFilesParsed++;
+        parsed++;
+        continue;
+      }
     }
 
     const info = classifyReport(text);
@@ -1740,6 +1929,18 @@ async function runAnalysis() {
   setProgress(90, 'Aggregating patterns...', '');
   await new Promise(r => setTimeout(r, 50));
 
+  // Roster names never seen in ANY uploaded Staff Sales report (any venue,
+  // any week) — surfaced as a count rather than silently dropped, same as
+  // every other unmatched/unparseable case in this loop.
+  let rosterUnmatchedCount = 0;
+  if (rosterFilesParsed > 0) {
+    const allStaffNames = new Set();
+    Object.values(venues).forEach(v => {
+      v.weekly.staffSales.forEach(week => week.rows.forEach(r => allStaffNames.add(r.name.toLowerCase().trim())));
+    });
+    rosterUnmatchedCount = Object.keys(rosterByName).filter(k => !allStaffNames.has(k)).length;
+  }
+
   const venueNames = Object.keys(venues);
 
   if (venueNames.length === 0 || parsed === 0) {
@@ -1764,7 +1965,8 @@ async function runAnalysis() {
     `${venueNames.length} venue${venueNames.length === 1 ? '' : 's'} analysed`;
   document.getElementById('results-meta').textContent =
     `${parsed} files parsed · ${failed > 0 ? failed + ' skipped' : 'all files read successfully'}` +
-    (periodSummarySkipped > 0 ? ` · ${periodSummarySkipped} period summary file${periodSummarySkipped === 1 ? '' : 's'} seen (not yet charted)` : '');
+    (periodSummarySkipped > 0 ? ` · ${periodSummarySkipped} period summary file${periodSummarySkipped === 1 ? '' : 's'} seen (not yet charted)` : '') +
+    (rosterFilesParsed > 0 ? ` · ${rosterFilesParsed} roster file${rosterFilesParsed === 1 ? '' : 's'} loaded (${Object.keys(rosterByName).length} staff${rosterUnmatchedCount ? `, ${rosterUnmatchedCount} not found in any Staff Sales report` : ''})` : '');
 
   const container = document.getElementById('venue-results');
   container.innerHTML = '';
@@ -1839,7 +2041,8 @@ async function runAnalysis() {
     }).join('');
 
     const weeklySection = hasWeekly ? `
-      ${staffLeaderboardHTML(v.weekly.staffSales)}
+      ${staffLeaderboardHTML(v.weekly.staffSales, rosterByName, venueName)}
+      ${staffProductivityHTML(v.weekly.staffSales, rosterByName, venueName)}
       ${staffTotalsHTML(v.weekly.staffSales)}
       ${cogsHTML(v.weekly.cogs)}
       ${cogsTotalsHTML(v.weekly.cogs)}
@@ -1876,7 +2079,7 @@ async function runAnalysis() {
     container.appendChild(section);
 
     if (primary || hasWeekly || hasPeriodSummary) {
-      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary);
+      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary, rosterByName);
       briefTargets.push({ prompt, el: section.querySelector(`#brief-${vslug}`) });
     } else {
       section.querySelector(`#brief-${vslug}`).textContent = 'Not enough category data for a narrative on this venue.';
