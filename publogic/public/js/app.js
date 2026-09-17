@@ -28,7 +28,7 @@ let allFiles = [];
 // which label follows which (field order varies: daily reports go
 // Venue/Store/Till/Period, weekly ones go Group/Period, Stock Loss puts
 // Period before Venue, etc).
-const HEADER_STOP_LABELS = ['Venue', 'Store', 'Till', 'Display Period', 'Period', 'Group', 'From Shift', 'To Shift', 'Flags', 'FILTER', 'Product'];
+const HEADER_STOP_LABELS = ['Venue', 'Store', 'Till', 'Display Period', 'Period', 'Group', 'From Shift', 'To Shift', 'Flags', 'FILTER', 'Product', 'Report By Location', 'Table Group'];
 
 // Pulls "Label : value" out of the flattened report text, stopping at the
 // next header label (whichever comes first) or end of text.
@@ -55,8 +55,20 @@ function extractTitle(text) {
   // Same word-boundary reasoning as extractField above: without \b, "Venue"
   // can match inside "Revenue" deep in the report body and drag the
   // "title" capture across nearly the whole document.
-  const m = text.match(/^\s*(.*?)\s*(?:\bProduct\s*:|\bVenue\s*:|(?<!Product\s)\bGroup\s*:)/i);
-  return m ? m[1].trim() : '';
+  const m = text.match(/^\s*(.*?)\s*(?:\bProduct\s*:|\bVenue\s*:|\bStore\s*:|\bTill\s*:|\bDisplay Period\s*:|\bFrom Shift\s*:|(?<!Product\s)\bGroup\s*:)/i);
+  let title = m ? m[1].trim() : text.trim();
+
+  // Belt-and-braces cap: some weekly XLSX exports put the Criteria sheet
+  // (and therefore every stop label above) at the very END of the workbook,
+  // after a large data table and sometimes a ValueList_Helper lookup sheet
+  // — e.g. a Stock Loss weekly export's Criteria sheet lands after ~230 rows
+  // of transaction data. Without a cap, the "title" balloons to include that
+  // entire table, which can then accidentally contain an unrelated keyword
+  // (a till named "Bottleshop 4", a comment mentioning "food", etc) and
+  // hijack classifyReport's keyword matching. The real title is always the
+  // first sheet's name, well under this length.
+  if (title.length > 80) title = title.slice(0, 80).trim();
+  return title;
 }
 
 // The trading date lives in the report body ("From Shift: Shift: 1
@@ -81,7 +93,15 @@ function extractShiftDate(text) {
 
 // Weekly reports cover a From/To range rather than a single trading day.
 function extractShiftDateRange(text) {
-  const m = text.match(/From Shift:\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4}).*?To Shift:\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4})/is);
+  let m = text.match(/From Shift:\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4}).*?To Shift:\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4})/is);
+  if (!m) {
+    // Bepoz's weekly XLSX exports don't carry "From Shift:...To Shift:..."
+    // at all — the range instead lives in "Display Period: Last Week
+    // (Shift: 1 07/09/2026 - Shift: 1 13/09/2026 (7 Days))" on the Criteria
+    // sheet, confirmed consistent across every weekly XLSX report family
+    // (Staff Sales, Product Summary, Stock Loss, Bulk Beer Litres, ...).
+    m = text.match(/Display Period:.{0,30}?\(\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4})\s*-\s*Shift:\s*\d+\s+(\d{1,2})\/(\d{1,2})\/(\d{4})/is);
+  }
   if (!m) return null;
   const from = new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
   const to   = new Date(parseInt(m[6]), parseInt(m[5]) - 1, parseInt(m[4]));
@@ -104,51 +124,89 @@ function extractDateFromFilename(name) {
 function classifyReport(text) {
   // Most reports carry "Venue :"; Staff Sales instead only has "Group :
   // Commodore" (a shorthand for the venue name — merged back together by
-  // resolveVenueKey at aggregation time).
+  // resolveVenueKey at aggregation time). Bepoz's weekly Staff Sales XLSX
+  // export carries neither field at all (confirmed on real Harbord Hotel
+  // data — its Criteria sheet has no Venue/Store/Group row whatsoever), so
+  // this can legitimately come back empty; callers fold the placeholder
+  // into whichever single real venue is already in the batch, the same way
+  // a generic "All Venues" filter is folded (see resolveVenueKey).
   const venue = extractField(text, 'Venue') || extractField(text, 'Group');
   const store = extractField(text, 'Store');
-  if (!venue) return null;
 
   const title = extractTitle(text);
   const t = title.toLowerCase();
   const s = (store || '').toLowerCase();
   const isAllStores = !store || /all stores/.test(s);
 
+  // Nothing to identify this report by at all — genuinely unparseable.
+  if (!venue && !title) return null;
+
   // Checked independently of the title — Period Summaries have a
   // multi-column layout where text extraction order can vary, but these
   // section headers are distinctive and always present.
   if (/stock summary|banking summary|opening stock/i.test(text)) {
-    return { venue, store, title: title || 'Period Summary', category: 'period_summary', subVenue: null };
+    return { venue: venue || '(Unknown Venue)', store, title: title || 'Period Summary', category: 'period_summary', subVenue: null };
   }
+
+  // Bepoz's weekly exports carry a "Display Period: Last Week (Shift: N D1
+  // - Shift: N D2 (N Days))" range instead of a single trading-day shift —
+  // used below to keep a weekly-shaped report that doesn't match any known
+  // weekly sub-type out of the daily-report categories (dept/food/bar_bev/
+  // bshop), which expect a single day of hourly data, not a 7-day range.
+  // NOTE: a *daily* report's own "From Shift:...To Shift:..." line also
+  // matches extractShiftDateRange (a single trading day is a range whose
+  // from/to dates happen to be equal), so isWeekly requires an actual
+  // multi-day span, not just a successful range match.
+  const shiftRange = extractShiftDateRange(text);
+  const isWeekly = !!shiftRange && shiftRange.from.getTime() !== shiftRange.to.getTime();
 
   let category, subVenue = null;
 
-  if (/bottle|bshop/.test(t) || /bottle|bshop/.test(s)) {
-    category = 'bshop';
-  } else if (/department|\bdept\b/.test(t)) {
-    category = 'dept';
-  } else if (/staff sales/.test(t)) {
+  // Specific report-type keywords are checked FIRST, before the generic
+  // store-name-based shortcuts below — otherwise a weekly Product Summary
+  // report against a store named "HH Bottleshop" (real example: Harbord
+  // Hotel's "Prod Summ Weekly Bshop") gets hijacked into the daily 'bshop'
+  // headline category purely because its store name contains "Bottleshop",
+  // never reaching the "prod summ" check at all.
+  if (/staff sales/.test(t)) {
     category = 'staff_sales';
   } else if (/weekly cog|\bcog\b/.test(t)) {
     category = 'cogs';
-  } else if (/prod(uct)?\s*summ/.test(t)) {
+  } else if (/\bprod(uct)?\s*summ?\b/.test(t)) {
+    // Matches "Prod Summ"/"Product Summary" (the common spelling) and also
+    // "Prod Sum" (single 'm' — confirmed on Harbord's BombieFood/Hotel Food
+    // Product Summary weekly exports).
     category = 'product_mix';
-  } else if (/stock loss/.test(t)) {
+  } else if (/stock\s*loss/.test(t)) {
+    // \s* (not a literal space) also matches "Stockloss" run together —
+    // confirmed on Harbord's "Manager Stockloss Last WK" export.
     category = 'stock_loss';
   } else if (/account\s*summ/.test(t)) {
     category = 'account_summary';
+  } else if (/bottle|bshop/.test(t) || /bottle|bshop/.test(s)) {
+    category = isWeekly ? 'unsupported_weekly' : 'bshop';
+  } else if (/department|\bdept\b/.test(t)) {
+    category = isWeekly ? 'unsupported_weekly' : 'dept';
   } else if (/food/.test(t) && /bev/.test(t)) {
-    category = 'food_bev_combined';
-    subVenue = isAllStores ? null : store;
+    category = isWeekly ? 'unsupported_weekly' : 'food_bev_combined';
+    subVenue = isWeekly ? null : (isAllStores ? null : store);
   } else if (/food/.test(t)) {
-    category = 'food';
-    subVenue = isAllStores ? null : store;
+    category = isWeekly ? 'unsupported_weekly' : 'food';
+    subVenue = isWeekly ? null : (isAllStores ? null : store);
   } else if (/main\s*bar|\bmbar\b|\bhotel\b/.test(t)) {
     // Some venues rename their main-bar report over time without changing
     // its Store field — Harbord Hotel's "Mbar Time Break Alcoholic" and
     // "HH Hotel Time Break Alc" are confirmed to be the same report family
     // (both against Store "HH Hotel"), just from different periods.
-    category = 'bar_bev';
+    category = isWeekly ? 'unsupported_weekly' : 'bar_bev';
+  } else if (isWeekly) {
+    // A genuinely new/unrecognised weekly report shape (e.g. Harbord's
+    // "Bulk Beer Litres Last Week", which has no product-mix-style keyword
+    // and a plain "All Stores" store field) — surfaced to the user as
+    // "recognised, not yet supported" rather than being force-fitted into
+    // a daily category and run through hourly parsing, which is the exact
+    // "weekly treated as daily" symptom this was built to fix.
+    category = 'unsupported_weekly';
   } else {
     // Anything else beverage/alcoholic-flavoured that isn't the main bar
     // is treated as a satellite bar (Peregrin, Bombies, Smugglers, ...).
@@ -156,7 +214,7 @@ function classifyReport(text) {
     subVenue = isAllStores ? null : store;
   }
 
-  return { venue, store, title, category, subVenue };
+  return { venue: venue || '(Unknown Venue)', store, title, category, subVenue };
 }
 
 // "Commodore" (from a Staff Sales report's Group field) and "Commodore
@@ -165,7 +223,11 @@ function classifyReport(text) {
 // whichever name is more descriptive as the canonical key.
 function resolveVenueKey(venues, rawName) {
   const norm = s => s.toLowerCase().trim();
-  const isGeneric = s => /^all venues?$/i.test(s);
+  // "(Unknown Venue)" is classifyReport's placeholder for a report with no
+  // Venue/Store/Group field at all (Bepoz's weekly Staff Sales export) —
+  // folded into the batch's one real venue exactly like a generic "All
+  // Venues" filter.
+  const isGeneric = s => /^all venues?$/i.test(s) || /^\(unknown venue\)$/i.test(s);
   const n = norm(rawName);
   const keys = Object.keys(venues);
 
@@ -1110,7 +1172,7 @@ async function runAnalysis() {
     const info = classifyReport(text);
     if (!info) {
       failed++;
-      failureSamples.push(`${f.name}: could not find a Venue field in the report`);
+      failureSamples.push(`${f.name}: could not identify a venue or report type in the report`);
       continue;
     }
 
@@ -1135,9 +1197,11 @@ async function runAnalysis() {
       continue;
     }
 
-    if (info.category === 'stock_loss' || info.category === 'account_summary') {
+    if (info.category === 'stock_loss' || info.category === 'account_summary' || info.category === 'unsupported_weekly') {
       // Recognised so they don't show up as parse failures, but no UI built
-      // for them yet.
+      // for them yet — covers known-but-unbuilt weekly report types (Stock
+      // Loss, Account Summary) as well as any weekly-shaped report that
+      // doesn't match a known sub-type at all (e.g. Bulk Beer Litres).
       v.unsupportedWeeklyCount++;
       continue;
     }
@@ -1299,7 +1363,7 @@ async function runAnalysis() {
     section.innerHTML = `
       <div class="venue-header">
         <h3>${venueName}</h3>
-        <p class="results-meta">${dateRange}${v.periodSummaryCount ? ` · ${v.periodSummaryCount} period summary file${v.periodSummaryCount === 1 ? '' : 's'} not charted` : ''}${v.unsupportedWeeklyCount ? ` · ${v.unsupportedWeeklyCount} stock loss/account summary file${v.unsupportedWeeklyCount === 1 ? '' : 's'} not charted yet` : ''}</p>
+        <p class="results-meta">${dateRange}${v.periodSummaryCount ? ` · ${v.periodSummaryCount} period summary file${v.periodSummaryCount === 1 ? '' : 's'} not charted` : ''}${v.unsupportedWeeklyCount ? ` · ${v.unsupportedWeeklyCount} weekly report file${v.unsupportedWeeklyCount === 1 ? '' : 's'} recognised but not charted yet (stock loss, account summary, or another type without a dashboard yet)` : ''}</p>
       </div>
       <div class="metrics-grid">${metricsHTML}</div>
       ${subVenueList.length ? `<div class="result-card"><div class="card-label">Sub-venues / satellite bars</div><div class="metrics-grid">${subVenueHTML}</div></div>` : ''}
