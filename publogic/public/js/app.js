@@ -360,6 +360,26 @@ function round2(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
 
+// Bepoz's XLSX exports store DateTime cells as raw Excel serial numbers
+// (days since 1899-12-30, with the time of day as a fraction — e.g.
+// 46272.526...) once read via sheet_to_json's raw:true mode. SheetJS only
+// converts a date-formatted cell to a real JS Date when the workbook itself
+// is parsed with {cellDates: true}, which extractXLSXText doesn't set (its
+// own flattened text output needs raw:false's formatted display strings, not
+// Date objects) — so every date/time column read by the workbook-parsing
+// path below was rendering as that raw serial number verbatim instead of a
+// date, confirmed on real Harbord Hotel Stock Loss / Manager Stockloss data.
+// 25569 is the number of days between the Excel epoch (1899-12-30) and the
+// Unix epoch (1970-01-01).
+function excelSerialToDate(serial) {
+  return new Date(Math.round((serial - 25569) * 86400 * 1000));
+}
+function formatCellDate(value) {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'number' && Number.isFinite(value)) return excelSerialToDate(value).toISOString();
+  return value ? String(value) : '';
+}
+
 // parseStaffSalesRows/parseSizedRows above read the flattened, regex-matched
 // text — which works for PDF weekly reports because Bepoz's PDF renderer
 // always prints every figure pre-formatted ("$1,204.70", "67.34%"). Bepoz's
@@ -470,7 +490,7 @@ function parseWeeklyStaffSalesRows(workbook) {
       costOfSales: round2(r[6]),
       profitAmt: round2(r[7]),
       profitPct: round2(Number(r[8]) * 100),
-      lastTrans: r[9] ? String(r[9]) : '',
+      lastTrans: formatCellDate(r[9]),
     });
   }
   return out;
@@ -504,7 +524,7 @@ function parseStockLossRows(workbook) {
     if (!transId || typeof transId !== 'number') continue; // "Totals:" row or blank
     const amount = round2(r[5]);
     events.push({
-      date: r[0] ? String(r[0]) : '',
+      date: formatCellDate(r[0]),
       till: (r[3] || '').toString().trim() || 'Unknown till',
       operator: (r[4] || '').toString().trim(),
       amount,
@@ -560,7 +580,7 @@ function parseTableWriteoffRows(workbook) {
     const rawName = (r[10] || '').toString().trim();
     events.push({
       tableNumber: (r[1] || '').toString().trim(),
-      dateOpened: r[2] ? String(r[2]) : '',
+      dateOpened: formatCellDate(r[2]),
       amount: round2(losses),
       name: rawName || 'Unnamed',
       reason: classifyWriteoffReason(rawName),
@@ -2057,6 +2077,17 @@ async function runAnalysis() {
       .map(store => periodSummaryHTML(store) + discountBreakdownHTML(store))
       .join('');
 
+    const availableMonths = getAvailableMonths(v);
+    const monthlyTriggerHTML = availableMonths.length ? `
+      <div class="result-card monthly-trigger-card">
+        <div class="card-label">Monthly dashboard</div>
+        <div class="monthly-controls">
+          <select id="monthly-select-${vslug}">${availableMonths.map(m => `<option value="${m.key}">${monthLabel(m.key)} — ${m.dayCount} of ~${daysInMonth(m.key)} days${m.weekCount ? `, ${m.weekCount} weekly report${m.weekCount === 1 ? '' : 's'}` : ''}</option>`).join('')}</select>
+          <button class="btn-reset" id="monthly-btn-${vslug}">Generate monthly dashboard</button>
+        </div>
+      </div>
+      <div id="monthly-output-${vslug}"></div>` : '';
+
     const section = document.createElement('div');
     section.className = 'venue-section';
     section.innerHTML = `
@@ -2075,8 +2106,36 @@ async function runAnalysis() {
           <span class="powered-by">Powered by Claude</span>
         </div>
         <div class="brief-text" id="brief-${vslug}"></div>
-      </div>`;
+      </div>
+      ${monthlyTriggerHTML}`;
     container.appendChild(section);
+
+    // Monthly dashboard is opt-in (button click), not part of the main
+    // analysis run — building it needs its own AI call, so it shouldn't slow
+    // down or clutter every single upload, only the ones where someone
+    // actually wants the one-page view.
+    const monthlyBtn = section.querySelector(`#monthly-btn-${vslug}`);
+    if (monthlyBtn) {
+      monthlyBtn.addEventListener('click', async () => {
+        const select = section.querySelector(`#monthly-select-${vslug}`);
+        const outEl = section.querySelector(`#monthly-output-${vslug}`);
+        monthlyBtn.disabled = true;
+        monthlyBtn.textContent = 'Generating…';
+        const mk = select.value;
+        const monthlyData = buildMonthlyData(v, mk, rosterByName, venueName);
+        outEl.innerHTML = monthlyDashboardHTML(venueName, monthlyData);
+        const narrativeEl = outEl.querySelector('.monthly-narrative-text');
+        const exportBtn = outEl.querySelector('.monthly-export-btn');
+        if (narrativeEl) await streamBrief(buildMonthlyPrompt(venueName, monthlyData), narrativeEl);
+        if (exportBtn) {
+          exportBtn.disabled = false;
+          exportBtn.addEventListener('click', () => exportMonthlyPDF(vslug));
+        }
+        monthlyBtn.disabled = false;
+        monthlyBtn.textContent = 'Regenerate monthly dashboard';
+        outEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
 
     if (primary || hasWeekly || hasPeriodSummary) {
       const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary, rosterByName);
@@ -2090,6 +2149,382 @@ async function runAnalysis() {
   for (const { prompt, el } of briefTargets) {
     await streamBrief(prompt, el);
   }
+}
+
+/* ── Monthly Dashboard (one-page, generated on demand) ──────────────────────
+   Everything else in the app works off daily entries (byDate, keyed
+   "YYYY-MM-DD") and weekly entries (weekStart/weekEnd Date objects) — there's
+   no native "month" anywhere in the data model. A month here is purely a
+   view: whatever daily entries' date key starts with "YYYY-MM", and whatever
+   weekly entries' weekStart falls in that calendar month (a week that spans
+   a month boundary is counted in the month its FIRST day falls in — same
+   "week of" convention used everywhere else in the app). Built on demand
+   (button click) rather than automatically, since "a full month" is a fuzzy
+   threshold that depends entirely on what's been uploaded. ────────────────── */
+
+function monthKeyOf(dateKeyStr) { return dateKeyStr.slice(0, 7); }
+function monthLabel(mk) {
+  const [y, m] = mk.split('-').map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString('en-AU', { month: 'long', year: 'numeric' });
+}
+function daysInMonth(mk) {
+  const [y, m] = mk.split('-').map(Number);
+  return new Date(y, m, 0).getDate();
+}
+function prevMonthKey(mk) {
+  const [y, m] = mk.split('-').map(Number);
+  const d = new Date(y, m - 2, 1); // m is 1-indexed; -2 steps back one month from a 0-indexed Date
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+function filterByDateToMonth(byDate, mk) {
+  const out = {};
+  Object.entries(byDate).forEach(([k, val]) => { if (monthKeyOf(k) === mk) out[k] = val; });
+  return out;
+}
+function isWeekInMonth(weekStart, mk) {
+  return monthKeyOf(dateKey(weekStart)) === mk;
+}
+function monthTrendHTML(current, previous) {
+  if (previous === undefined || previous === null || previous === 0) return '';
+  const pct = (current - previous) / previous * 100;
+  if (Math.abs(pct) < 1) return '';
+  const dir = pct > 0 ? 'up' : 'down';
+  return ` <span class="powered-by">${dir} ${Math.abs(pct).toFixed(0)}% vs ${cur(previous)} last month</span>`;
+}
+
+// Scans a venue's data for which calendar months have anything to show, and
+// how much — daily coverage (days seen / days in that month, unioned across
+// every daily source so a month with ONLY Period Summary data still counts)
+// and weekly coverage (distinct weeks whose weekStart falls in the month,
+// unioned across every weekly report series so uploading both Staff Sales
+// and COG for the same week doesn't double-count it as two weeks).
+function getAvailableMonths(v) {
+  const months = {};
+  const touch = mk => (months[mk] = months[mk] || { key: mk, dayCount: 0, weekKeys: new Set() });
+
+  const dayKeysSeen = new Set();
+  Object.values(v.categories).forEach(cat => Object.keys(cat.byDate).forEach(dk => dayKeysSeen.add(dk)));
+  Object.values(v.subVenues || {}).forEach(sv => Object.keys(sv.byDate).forEach(dk => dayKeysSeen.add(dk)));
+  Object.values(v.periodSummary || {}).forEach(store => Object.keys(store.byDate).forEach(dk => dayKeysSeen.add(dk)));
+  dayKeysSeen.forEach(dk => touch(monthKeyOf(dk)).dayCount++);
+
+  const addWeeks = entries => entries.forEach(e => touch(monthKeyOf(dateKey(e.weekStart))).weekKeys.add(dateKey(e.weekStart)));
+  addWeeks(v.weekly.staffSales);
+  addWeeks(v.weekly.cogs);
+  Object.values(v.weekly.productMix).forEach(addWeeks);
+  addWeeks(v.weekly.stockLoss);
+  addWeeks(v.weekly.tableWriteoffs);
+  addWeeks(v.weekly.bulkBeer);
+
+  return Object.values(months)
+    .map(m => ({ key: m.key, dayCount: m.dayCount, weekCount: m.weekKeys.size }))
+    .sort((a, b) => b.key.localeCompare(a.key));
+}
+
+// Pulls together every figure the one-pager needs for a single calendar
+// month — daily categories via computeStats (same function the regular
+// per-category charts use, just fed a date-filtered subset), weekly series
+// aggregated across however many weeks in the month via the existing
+// aggregateRows/aggregateDiscounts helpers, and a roster-hours productivity
+// view built by summing roster.hours once per week a person appears (the
+// roster template has no date field, so this assumes the same weekly hours
+// repeats for every week they show up on the leaderboard that month — an
+// approximation stated plainly in the card, not hidden).
+function buildMonthlyData(v, mk, rosterByName, venueName) {
+  const data = { monthKey: mk, label: monthLabel(mk), daysInMonth: daysInMonth(mk) };
+  const prevMk = prevMonthKey(mk);
+
+  data.categoryStats = Object.keys(v.categories).map(key => {
+    const stats = computeStats(filterByDateToMonth(v.categories[key].byDate, mk));
+    if (!stats) return null;
+    const prevStats = computeStats(filterByDateToMonth(v.categories[key].byDate, prevMk));
+    return { key, label: CATEGORY_LABELS[key] || key, stats, prevTotal: prevStats ? prevStats.total : null };
+  }).filter(Boolean).sort((a, b) => {
+    const ai = HEADLINE_PRIORITY.indexOf(a.key), bi = HEADLINE_PRIORITY.indexOf(b.key);
+    if (ai === -1 && bi === -1) return 0;
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+
+  const staffWeeks = v.weekly.staffSales.filter(e => isWeekInMonth(e.weekStart, mk));
+  data.staffWeekCount = staffWeeks.length;
+  data.staffTotals = staffWeeks.length
+    ? aggregateRows(staffWeeks, ['transactions']).sort((a, b) => b.nettTotal - a.nettTotal)
+    : [];
+
+  const cogsWeeks = v.weekly.cogs.filter(e => isWeekInMonth(e.weekStart, mk));
+  data.cogsWeekCount = cogsWeeks.length;
+  data.cogsTotals = cogsWeeks.length
+    ? aggregateRows(cogsWeeks, []).sort((a, b) => b.nettTotal - a.nettTotal)
+    : [];
+
+  data.productMixByStore = {};
+  Object.entries(v.weekly.productMix).forEach(([store, entries]) => {
+    const inMonth = entries.filter(e => isWeekInMonth(e.weekStart, mk));
+    if (inMonth.length) data.productMixByStore[store] = aggregateRows(inMonth, ['qty']).sort((a, b) => b.nettTotal - a.nettTotal);
+  });
+
+  const stockLossWeeks = v.weekly.stockLoss.filter(e => isWeekInMonth(e.weekStart, mk));
+  data.stockLoss = stockLossWeeks.length
+    ? { total: round2(stockLossWeeks.reduce((s, e) => s + e.data.total, 0)), count: stockLossWeeks.reduce((s, e) => s + e.data.count, 0), weekCount: stockLossWeeks.length }
+    : null;
+
+  const writeoffWeeks = v.weekly.tableWriteoffs.filter(e => isWeekInMonth(e.weekStart, mk));
+  data.tableWriteoffs = writeoffWeeks.length
+    ? { total: round2(writeoffWeeks.reduce((s, e) => s + e.data.total, 0)), count: writeoffWeeks.reduce((s, e) => s + e.data.count, 0), weekCount: writeoffWeeks.length }
+    : null;
+
+  const bulkBeerWeeks = v.weekly.bulkBeer.filter(e => isWeekInMonth(e.weekStart, mk));
+  if (bulkBeerWeeks.length) {
+    const rows = bulkBeerWeeks.flatMap(e => e.rows);
+    data.bulkBeer = { litres: round2(rows.reduce((s, r) => s + r.litresSold, 0)), nettTotal: round2(rows.reduce((s, r) => s + r.nettTotal, 0)), weekCount: bulkBeerWeeks.length };
+  }
+
+  data.periodSummaryStores = [];
+  Object.values(v.periodSummary || {}).forEach(store => {
+    const days = Object.values(filterByDateToMonth(store.byDate, mk));
+    if (!days.length) return;
+    const grossTotal = round2(days.reduce((s, d) => s + (d.grossSales || 0), 0));
+    const nettTotal = round2(days.reduce((s, d) => s + (d.nettTotal || 0), 0));
+    const costTotal = round2(days.reduce((s, d) => s + (d.costOfSales || 0), 0));
+    const profitTotal = round2(days.reduce((s, d) => s + (d.profitAmt || 0), 0));
+    const varianceDays = days.filter(d => d.difference !== null && Math.abs(d.difference) >= TILL_VARIANCE_THRESHOLD);
+    data.periodSummaryStores.push({
+      label: store.label, dayCount: days.length,
+      grossTotal, nettTotal, costTotal, profitTotal,
+      profitPct: nettTotal > 0 ? round2(profitTotal / nettTotal * 100) : 0,
+      varianceDayCount: varianceDays.length,
+      discounts: aggregateDiscounts(days),
+    });
+  });
+
+  if (staffWeeks.length && Object.keys(rosterByName).length) {
+    const byDept = new Map();
+    const staffSeen = new Set(), staffMatched = new Set();
+    staffWeeks.forEach(w => w.rows.forEach(r => {
+      staffSeen.add(r.name.toLowerCase());
+      const roster = matchRosterEntry(rosterByName, r.name, venueName);
+      if (!roster || !roster.hours) return;
+      staffMatched.add(r.name.toLowerCase());
+      const dept = roster.department || (isManagerRole(roster.role) ? 'Management / floating' : 'Unassigned department');
+      const agg = byDept.get(dept) || { dept, revenue: 0, hours: 0 };
+      agg.revenue += r.nettTotal;
+      agg.hours += roster.hours; // summed once per week appeared — see function comment
+      byDept.set(dept, agg);
+    }));
+    if (byDept.size) {
+      data.productivity = {
+        byDept: Array.from(byDept.values()).map(d => ({ ...d, perHour: d.hours > 0 ? d.revenue / d.hours : 0 })).sort((a, b) => b.perHour - a.perHour),
+        matchedCount: staffMatched.size, totalCount: staffSeen.size, weekCount: staffWeeks.length,
+      };
+    }
+  }
+
+  return data;
+}
+
+// A day-of-week chart (dowChartHTML, reused above) shows the SHAPE of a
+// typical week — great for staffing decisions, useless for "how did revenue
+// actually move through the month". This plots one bar per calendar day in
+// date order instead, including days with no upload at all (shown as a flat
+// light-gray bar via title="no data uploaded") so gaps in the month are as
+// visible as the trend itself, not silently smoothed away. Color uses the
+// same single-hue intensity ramp as the hourly heatmap (heatmapHTML) rather
+// than a new palette, so a "busier day" reads the same shade of teal
+// wherever it shows up in the app.
+function dailyTrendChartHTML(stats, mk) {
+  const totalsByDay = {};
+  stats.days.forEach(d => { totalsByDay[Number(dateKey(d.date).slice(8, 10))] = d.total; });
+  const numDays = daysInMonth(mk);
+  const maxVal = Math.max(1, ...Array.from({ length: numDays }, (_, i) => totalsByDay[i + 1] || 0));
+
+  const bars = Array.from({ length: numDays }, (_, i) => {
+    const dayNum = i + 1;
+    const val = totalsByDay[dayNum];
+    const has = val !== undefined;
+    const intensity = has ? val / maxVal : 0;
+    const bg = !has || intensity < 0.05
+      ? '#F3F4F6'
+      : `rgb(${Math.round(15 + 40 * (1 - intensity))},${Math.round(100 + 58 * (1 - intensity))},${Math.round(130 * (1 - intensity))})`;
+    const h = has ? Math.max(3, Math.round(intensity * 100)) : 3;
+    return `<div class="daily-bar" title="Day ${dayNum}: ${has ? cur(val) : 'no data uploaded'}">
+      <div class="daily-bar-fill" style="height:${h}%;background:${bg}"></div>
+      <div class="daily-bar-label">${dayNum}</div>
+    </div>`;
+  }).join('');
+
+  return `<div class="daily-trend-chart">${bars}</div>`;
+}
+
+function monthlyDashboardHTML(venueName, data) {
+  const catTiles = data.categoryStats.map(c => `
+    <div class="metric-card">
+      <div class="metric-label">${c.label}</div>
+      <div class="metric-value">${cur(c.stats.total)}</div>
+      <div class="metric-sub">${c.stats.days.length} days · avg ${cur(c.stats.avg)}/day${monthTrendHTML(c.stats.total, c.prevTotal)}</div>
+    </div>`).join('');
+
+  const headline = data.categoryStats[0];
+  const dailyTrendSection = headline ? `
+    <div class="result-card">
+      <div class="card-label">Daily revenue — ${headline.label}</div>
+      <div>${dailyTrendChartHTML(headline.stats, data.monthKey)}</div>
+    </div>` : '';
+  const dowSection = headline ? `
+    <div class="result-card">
+      <div class="card-label">Revenue by day of week — ${headline.label}</div>
+      <div>${dowChartHTML(headline.stats)}</div>
+    </div>` : '';
+
+  const staffSection = data.staffTotals.length ? `
+    <div class="result-card">
+      <div class="card-label">Top staff — ${data.staffWeekCount} week${data.staffWeekCount === 1 ? '' : 's'} this month</div>
+      <div class="data-table-wrap"><table class="data-table">
+        <thead><tr><th>Name</th><th class="num">Nett sales</th><th class="num">Txns</th><th class="num">Margin</th></tr></thead>
+        <tbody>${data.staffTotals.slice(0, 6).map(r => `
+        <tr><td>${r.name}</td><td class="num">${cur(r.nettTotal)}</td><td class="num">${r.transactions}</td><td class="num">${blendedProfitPct(r).toFixed(0)}%</td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>` : '';
+
+  const cogsSection = data.cogsTotals.length ? `
+    <div class="result-card">
+      <div class="card-label">Margin by category — ${data.cogsWeekCount} week${data.cogsWeekCount === 1 ? '' : 's'} this month</div>
+      <div class="data-table-wrap"><table class="data-table">
+        <thead><tr><th>Category</th><th class="num">Nett sales</th><th class="num">Margin</th></tr></thead>
+        <tbody>${data.cogsTotals.slice(0, 6).map(r => `
+        <tr><td>${r.name}</td><td class="num">${cur(r.nettTotal)}</td><td class="num">${blendedProfitPct(r).toFixed(0)}%</td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>` : '';
+
+  const productStores = Object.keys(data.productMixByStore);
+  const productSection = productStores.length ? `
+    <div class="result-card">
+      <div class="card-label">Top sellers this month</div>
+      ${productStores.map(store => `
+        <div class="metric-sub" style="margin-bottom:.5rem"><strong>${productStores.length > 1 ? store : 'Top products'}</strong>: ${data.productMixByStore[store].slice(0, 5).map(r => `${r.name} (${cur(r.nettTotal)})`).join(' · ')}</div>
+      `).join('')}
+    </div>` : '';
+
+  const opsTiles = [
+    data.stockLoss ? `<div class="metric-card"><div class="metric-label">Stock loss</div><div class="metric-value">${cur(data.stockLoss.total)}</div><div class="metric-sub">${data.stockLoss.count} events · ${data.stockLoss.weekCount} wk${data.stockLoss.weekCount === 1 ? '' : 's'}</div></div>` : '',
+    data.tableWriteoffs ? `<div class="metric-card"><div class="metric-label">Comps &amp; write-offs</div><div class="metric-value">${cur(data.tableWriteoffs.total)}</div><div class="metric-sub">${data.tableWriteoffs.count} tables · ${data.tableWriteoffs.weekCount} wk${data.tableWriteoffs.weekCount === 1 ? '' : 's'}</div></div>` : '',
+    data.bulkBeer ? `<div class="metric-card"><div class="metric-label">Bulk beer</div><div class="metric-value">${data.bulkBeer.litres.toFixed(0)}L</div><div class="metric-sub">${cur(data.bulkBeer.nettTotal)} nett · ${data.bulkBeer.weekCount} wk${data.bulkBeer.weekCount === 1 ? '' : 's'}</div></div>` : '',
+  ].filter(Boolean).join('');
+  const opsSection = opsTiles ? `<div class="metrics-grid">${opsTiles}</div>` : '';
+
+  const discSection = data.periodSummaryStores.some(s => s.discounts && s.discounts.rows.length) ? `
+    <div class="result-card">
+      <div class="card-label">Discounts this month</div>
+      ${data.periodSummaryStores.filter(s => s.discounts && s.discounts.rows.length).map(s => `
+        <div class="metric-sub" style="margin-bottom:.5rem"><strong>${s.label}</strong>: ${cur(Math.abs(s.discounts.total))} given away${s.discounts.pctOfGross !== null ? ` (${s.discounts.pctOfGross.toFixed(1)}% of gross)` : ''} — top: ${s.discounts.rows.slice(0, 3).map(r => `${r.label} ${cur(r.amount)}`).join(', ')}</div>
+      `).join('')}
+    </div>` : '';
+
+  const marginTiles = data.periodSummaryStores.length ? `
+    <div class="metrics-grid">${data.periodSummaryStores.map(s => `
+      <div class="metric-card">
+        <div class="metric-label">${s.label} margin</div>
+        <div class="metric-value">${s.profitPct.toFixed(0)}%</div>
+        <div class="metric-sub">${cur(s.nettTotal)} nett · ${s.dayCount} days${s.varianceDayCount ? ` · ${s.varianceDayCount} till variance day${s.varianceDayCount === 1 ? '' : 's'}` : ''}</div>
+      </div>`).join('')}</div>` : '';
+
+  const productivitySection = data.productivity ? `
+    <div class="result-card">
+      <div class="card-label">Revenue per labour hour by department</div>
+      <div class="metric-sub" style="margin-bottom:.75rem">${data.productivity.matchedCount} of ${data.productivity.totalCount} staff matched to roster hours, estimated across ${data.productivity.weekCount} week${data.productivity.weekCount === 1 ? '' : 's'} (assumes the roster's weekly hours repeat each week)</div>
+      <div class="data-table-wrap"><table class="data-table">
+        <thead><tr><th>Department</th><th class="num">Hours (est.)</th><th class="num">Revenue</th><th class="num">Revenue / hour</th></tr></thead>
+        <tbody>${data.productivity.byDept.map(d => `
+        <tr><td>${d.dept}</td><td class="num">${d.hours.toFixed(1)}</td><td class="num">${cur(d.revenue)}</td><td class="num">${cur(d.perHour)}</td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>` : '';
+
+  const vslug = slug(venueName);
+  return `<div class="monthly-dashboard">
+    <div class="monthly-header">
+      <div>
+        <div class="monthly-eyebrow">Monthly dashboard</div>
+        <h3>${venueName} — ${data.label}</h3>
+        <p class="results-meta">Generated ${new Date().toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })} · covers whatever was uploaded for this month, not necessarily every day</p>
+      </div>
+      <button class="btn-reset monthly-export-btn no-print" disabled>Export as PDF</button>
+    </div>
+    ${catTiles ? `<div class="metrics-grid">${catTiles}</div>` : ''}
+    ${marginTiles}
+    ${dailyTrendSection}
+    ${dowSection}
+    ${staffSection}
+    ${cogsSection}
+    ${productSection}
+    ${opsSection}
+    ${discSection}
+    ${productivitySection}
+    <div class="result-card brief-card">
+      <div class="card-label"><span>Monthly ops summary</span><span class="powered-by">Powered by Claude</span></div>
+      <div class="brief-text monthly-narrative-text" id="monthly-brief-${vslug}"></div>
+    </div>
+  </div>`;
+}
+
+// Condensed relative of buildPrompt — a month's headline figures only (no
+// hourly breakdown, no day-by-day tables), since this narrative is meant to
+// read as a 3-paragraph executive summary, not the same depth as the
+// per-upload ops brief.
+function buildMonthlyPrompt(venueName, data) {
+  const catLines = data.categoryStats.map(c =>
+    `- ${c.label}: ${cur(c.stats.total)} over ${c.stats.days.length} days, daily avg ${cur(c.stats.avg)}${c.prevTotal ? `, vs ${cur(c.prevTotal)} last month` : ''}`
+  ).join('\n');
+
+  const parts = [];
+  if (data.staffTotals.length) {
+    parts.push(`Top staff this month:\n` + data.staffTotals.slice(0, 6).map(r => `- ${r.name}: ${cur(r.nettTotal)} nett, ${blendedProfitPct(r).toFixed(0)}% margin`).join('\n'));
+  }
+  if (data.cogsTotals.length) {
+    parts.push(`Margin by category this month:\n` + data.cogsTotals.slice(0, 6).map(r => `- ${r.name}: ${cur(r.nettTotal)}, ${blendedProfitPct(r).toFixed(0)}% margin`).join('\n'));
+  }
+  if (data.periodSummaryStores.length) {
+    parts.push(`Daily sales & margin this month:\n` + data.periodSummaryStores.map(s =>
+      `- ${s.label}: ${cur(s.nettTotal)} nett, ${s.profitPct.toFixed(0)}% margin${s.varianceDayCount ? `, ${s.varianceDayCount} till variance day(s)` : ''}${s.discounts && s.discounts.rows.length ? `, ${cur(Math.abs(s.discounts.total))} in discounts (${s.discounts.pctOfGross !== null ? s.discounts.pctOfGross.toFixed(1) + '% of gross' : 'n/a'})` : ''}`
+    ).join('\n'));
+  }
+  if (data.stockLoss || data.tableWriteoffs) {
+    const bits = [];
+    if (data.stockLoss) bits.push(`stock loss ${cur(data.stockLoss.total)} across ${data.stockLoss.count} events`);
+    if (data.tableWriteoffs) bits.push(`comps/write-offs ${cur(data.tableWriteoffs.total)} across ${data.tableWriteoffs.count} tables`);
+    parts.push(`Loss & write-offs this month: ${bits.join('; ')}`);
+  }
+  if (data.productivity) {
+    parts.push(`Revenue per labour hour by department this month (estimated from roster hours, ${data.productivity.matchedCount} of ${data.productivity.totalCount} staff matched):\n` +
+      data.productivity.byDept.map(d => `- ${d.dept}: ${cur(d.perHour)}/hour`).join('\n'));
+  }
+
+  return `You are a hospitality operations consultant writing a MONTHLY executive summary for ${venueName}, covering ${data.label}. Write 3 tight paragraphs — no bullet points, no headers. This is a step back from day-to-day detail: focus on the month's overall trajectory, what changed vs last month where that data is available, and 2 specific things worth acting on before next month. Don't invent a single combined "total revenue" figure — this venue's categories are reported separately and shouldn't be summed.
+
+Revenue by category this month:
+${catLines}
+
+${parts.join('\n\n')}`;
+}
+
+// Exports the monthly dashboard by cloning its rendered HTML into a
+// dedicated print overlay and invoking the browser's native print dialog
+// ("Save as PDF" gets a clean one-pager). Scoping this way — rather than
+// hiding every other element on the page with a "no-print" class each —
+// means print output stays correct even as the rest of the page's markup
+// changes; @media print in style.css hides everything under <body> except
+// #print-overlay, which is otherwise always display:none on screen.
+function exportMonthlyPDF(vslug) {
+  const src = document.getElementById(`monthly-output-${vslug}`);
+  if (!src) return;
+  let overlay = document.getElementById('print-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'print-overlay';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = src.innerHTML;
+  window.print();
 }
 
 /* ── Reset ───────────────────────────────────────────────────────────────── */

@@ -720,3 +720,110 @@ body {
   .report-types { gap: .375rem; }
   .site-footer .container { flex-direction: column; align-items: flex-start; gap: .25rem; }
 }
+
+/* ── Monthly dashboard ──────────────────────────────────────────── */
+.monthly-trigger-card { background: var(--surface-2); }
+.monthly-controls { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+.monthly-controls select {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--ink-mid);
+  padding: .5rem .75rem;
+  border: 1px solid var(--rule-mid);
+  border-radius: var(--radius);
+  background: var(--surface);
+  flex: 1;
+  min-width: 220px;
+}
+
+.monthly-dashboard {
+  border: 1px solid var(--rule-mid);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem;
+  margin-top: 1rem;
+  background: var(--surface);
+}
+
+.monthly-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 2px solid var(--rule);
+}
+
+.monthly-eyebrow {
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--teal);
+  font-family: var(--font-mono);
+  margin-bottom: .25rem;
+}
+
+.monthly-header h3 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: -.01em;
+}
+
+.monthly-export-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Daily revenue trend (one bar per calendar day in the month) */
+.daily-trend-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 110px;
+}
+
+.daily-bar {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+}
+
+.daily-bar-fill {
+  width: 100%;
+  border-radius: 2px 2px 0 0;
+  transition: height .3s ease;
+}
+
+.daily-bar-label {
+  font-size: 8px;
+  color: var(--ink-faint);
+  margin-top: 3px;
+  font-family: var(--font-mono);
+}
+
+/* ── Print export (monthly dashboard only) ─────────────────────────
+   #print-overlay stays empty/hidden on screen; exportMonthlyPDF() fills it
+   with a clone of the generated dashboard right before calling
+   window.print(). Scoping print output to it (rather than marking every
+   other element "no-print") keeps this correct regardless of what else is
+   on the page. */
+#print-overlay { display: none; }
+@media print {
+  body > *:not(#print-overlay) { display: none !important; }
+  #print-overlay { display: block !important; }
+  #print-overlay .no-print { display: none !important; }
+  #print-overlay .monthly-dashboard {
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    margin: 0;
+  }
+  #print-overlay .result-card,
+  #print-overlay .metric-card {
+    break-inside: avoid;
+    box-shadow: none;
+  }
+}
