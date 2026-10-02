@@ -14,6 +14,7 @@
   --teal:      #0F766E;
   --teal-mid:  #14B8A6;
   --teal-light:#CCFBF1;
+  --terracotta:#C2572C; /* second data-series color (Gross sales, vs teal's Nett) — validated against --teal via the dataviz skill's CVD check; kept distinct from --amber, which is reserved for warning flags */
   --amber:     #D97706;
   --amber-light:#FEF3C7;
   --red-light: #FEE2E2;
@@ -824,6 +825,53 @@ body {
   margin-top: 3px;
   font-family: var(--font-mono);
 }
+
+/* Daily sales & margin chart (Gross vs Nett, one bar-pair per calendar day
+   spanning the store's whole uploaded date range — see dailySalesChartHTML) */
+.daily-sales-chart-wrap { margin-bottom: 1rem; }
+
+.ds-legend {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: .625rem;
+  font-size: 11px;
+  color: var(--ink-mute);
+}
+.ds-legend-item { display: flex; align-items: center; gap: .375rem; }
+.ds-legend-swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.ds-legend-swatch.nett  { background: var(--teal); }
+.ds-legend-swatch.gross { background: var(--terracotta); }
+
+.ds-chart-scroll { overflow-x: auto; padding-bottom: 2px; }
+
+.daily-sales-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 120px;
+  min-width: max-content;
+}
+
+.ds-day-group {
+  width: 14px;
+  flex-shrink: 0;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+}
+.ds-day-group.clickable { cursor: pointer; }
+.ds-day-group.clickable:hover .ds-bar { opacity: .8; }
+
+.ds-bar {
+  width: 5px;
+  border-radius: 2px 2px 0 0;
+  transition: height .3s ease, opacity .15s ease;
+}
+.ds-bar.gross    { background: var(--terracotta); }
+.ds-bar.nett     { background: var(--teal); }
+.ds-bar.no-data  { width: 100%; background: var(--surface-3); }
 
 /* ── Print export (monthly dashboard only) ─────────────────────────
    #print-overlay stays empty/hidden on screen; exportMonthlyPDF() fills it

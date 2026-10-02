@@ -963,19 +963,36 @@ dropZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === '
 fileInput.addEventListener('change', e => handleFiles(e.target.files));
 
 // Daily sales & margin tables render a hidden discount-breakdown row under
-// any day that has one (see periodSummaryHTML/discountMiniTableHTML below).
-// One delegated listener on the persistent results container handles every
-// venue's every store's table, present and future — results-panel's content
-// is fully replaced per analysis (container.innerHTML = ''), but the
-// container element itself never changes, so this never needs re-attaching.
+// any day that has one (see periodSummaryHTML/discountMiniTableHTML below),
+// and the Gross/Nett chart above the table (dailySalesChartHTML) renders a
+// matching clickable bar-group for the same days. Both delegated listeners
+// live on the persistent results container — results-panel's content is
+// fully replaced per analysis (container.innerHTML = ''), but the container
+// element itself never changes, so neither ever needs re-attaching.
+function setDayRowOpen(row, open) {
+  row.classList.toggle('expanded', open);
+  row.setAttribute('aria-expanded', String(open));
+  const detail = row.nextElementSibling;
+  if (detail && detail.classList.contains('day-detail-row')) detail.classList.toggle('open', open);
+}
+
 document.getElementById('venue-results').addEventListener('click', e => {
   const row = e.target.closest('tr.day-row.expandable');
-  if (!row) return;
-  const detail = row.nextElementSibling;
-  if (!detail || !detail.classList.contains('day-detail-row')) return;
-  const nowOpen = row.classList.toggle('expanded');
-  detail.classList.toggle('open', nowOpen);
-  row.setAttribute('aria-expanded', String(nowOpen));
+  if (row) {
+    setDayRowOpen(row, !row.classList.contains('expanded'));
+    return;
+  }
+  // A click on a chart bar-group jumps to and opens that day's row in the
+  // table below rather than duplicating the breakdown in the chart itself —
+  // closest('.result-card') scopes the lookup to this store's own card, so
+  // two stores that both have an entry for the same date don't cross-wire.
+  const bar = e.target.closest('.ds-day-group.clickable');
+  if (!bar) return;
+  const card = bar.closest('.result-card');
+  const target = card && card.querySelector(`tr.day-row[data-date="${bar.dataset.date}"]`);
+  if (!target) return;
+  setDayRowOpen(target, true);
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
 });
 // Enter/Space on a focused expandable row works the same as a click — the
 // rows are real <tr>s with tabindex/role="button", not <button>s, which
@@ -1510,6 +1527,72 @@ function discountMiniTableHTML(items, grossSales) {
     </table></div>`;
 }
 
+// Gross vs Nett, one bar-pair per calendar day spanning whatever range this
+// store's Period Summary files actually cover — not bounded to a month, the
+// way the Monthly Dashboard's dailyTrendChartHTML is, since this card shows
+// the whole uploaded history. Days with no Period Summary uploaded for them
+// render as a flat gray bar (same "don't smooth over gaps" convention as the
+// monthly chart) rather than being skipped, so a run of missing days is as
+// visible as the trend itself. Nett gets the app's own teal (the metric
+// margin/profit are actually calculated from); Gross gets a terracotta that
+// validates CVD-safe against teal (worst adjacent ΔE 8.9 protan / 23.7
+// normal-vision — teal's own chroma reads a little low for the validator's
+// categorical floor, as it does everywhere else teal is used as a solo
+// accent in this app, which is a known, accepted trait of the brand color
+// rather than something to fix here) — see the dataviz skill for the method.
+// Bars are clickable: a day with a discount breakdown scrolls to and expands
+// that day's row in the table below (see the delegated click handler),
+// rather than duplicating the breakdown in two places.
+function dailySalesChartHTML(days) {
+  const byKey = {};
+  days.forEach(d => { byKey[dateKey(d.date)] = d; });
+
+  const sorted = days.slice().sort((a, b) => a.date - b.date);
+  const start = sorted[0].date, end = sorted[sorted.length - 1].date;
+  const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const endUTC = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+  const calendarDays = [];
+  while (cursor <= endUTC) {
+    calendarDays.push(new Date(cursor));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  // A single uploaded day still deserves a chart, not a div-by-zero bar.
+  if (calendarDays.length < 2) return '';
+
+  const maxVal = Math.max(1, ...days.map(d => d.grossSales || 0));
+
+  const bars = calendarDays.map(cd => {
+    const key = dateKey(cd);
+    const d = byKey[key];
+    const dayNum = cd.getUTCDate();
+    const monthShort = cd.toLocaleDateString('en-AU', { month: 'short', timeZone: 'UTC' });
+
+    if (!d) {
+      return `<div class="ds-day-group" title="${dayNum} ${monthShort}: no data uploaded">
+        <div class="ds-bar no-data" style="height:3%"></div>
+      </div>`;
+    }
+
+    const hasDiscounts = !!(d.discounts && d.discounts.items && d.discounts.items.length);
+    const grossH = Math.max(2, ((d.grossSales || 0) / maxVal) * 100);
+    const nettH = Math.max(2, ((d.nettTotal || 0) / maxVal) * 100);
+    const clickable = hasDiscounts ? ' clickable' : '';
+    const hint = hasDiscounts ? ' — click to see discounts' : '';
+    return `<div class="ds-day-group${clickable}" data-date="${key}">
+        <div class="ds-bar gross" style="height:${grossH}%" title="${fmtDate(d.date)} — Gross: ${cur(d.grossSales)}${hint}"></div>
+        <div class="ds-bar nett" style="height:${nettH}%" title="${fmtDate(d.date)} — Nett: ${cur(d.nettTotal)}${hint}"></div>
+      </div>`;
+  }).join('');
+
+  return `<div class="daily-sales-chart-wrap">
+    <div class="ds-legend">
+      <div class="ds-legend-item"><span class="ds-legend-swatch nett"></span>Nett sales</div>
+      <div class="ds-legend-item"><span class="ds-legend-swatch gross"></span>Gross sales</div>
+    </div>
+    <div class="ds-chart-scroll"><div class="daily-sales-chart">${bars}</div></div>
+  </div>`;
+}
+
 function periodSummaryHTML(storeEntry) {
   const days = Object.values(storeEntry.byDate).sort((a, b) => b.date - a.date);
   if (!days.length) return '';
@@ -1529,7 +1612,7 @@ function periodSummaryHTML(storeEntry) {
     const rowOpenAttrs = hasDiscounts ? ' class="day-row expandable" tabindex="0" role="button" aria-expanded="false"' : '';
     const chevron = hasDiscounts ? '<span class="row-chevron">▸</span>' : '';
     const mainRow = `
-    <tr${rowOpenAttrs}>
+    <tr${rowOpenAttrs} data-date="${dateKey(d.date)}">
       <td>${chevron}${fmtDate(d.date)}</td>
       <td class="num">${fmtMoney(d.grossSales)}</td>
       <td class="num">${fmtMoney(d.nettTotal)}</td>
@@ -1553,6 +1636,7 @@ function periodSummaryHTML(storeEntry) {
 
   return `<div class="result-card">
     <div class="card-label">Daily sales &amp; margin — ${storeEntry.label}</div>
+    ${dailySalesChartHTML(days)}
     ${anyExpandable ? '<div class="metric-sub" style="margin-bottom:.5rem">Click a day with discounts to see what made it up</div>' : ''}
     <div class="data-table-wrap"><table class="data-table">
       <thead><tr><th>Date</th><th class="num">Gross sales</th><th class="num">Nett sales</th><th class="num">Cost of sales</th><th class="num">Profit</th><th class="num">Margin</th><th class="num">Till variance</th></tr></thead>
