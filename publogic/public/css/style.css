@@ -646,6 +646,27 @@ body {
 .data-table tbody tr:hover { background: var(--surface-2); }
 .data-table th.num, .data-table td.num { text-align: right; font-family: var(--font-mono); }
 
+/* Expandable day rows (Daily sales & margin -> per-day discount breakdown) */
+.data-table tr.day-row.expandable { cursor: pointer; }
+.data-table tr.day-row.expandable:hover,
+.data-table tr.day-row.expandable:focus-visible { background: var(--surface-2); }
+.data-table tr.day-row.expandable:focus-visible { outline: 2px solid var(--teal); outline-offset: -2px; }
+.row-chevron {
+  display: inline-block;
+  width: .85em;
+  color: var(--ink-faint);
+  transition: transform .15s ease;
+}
+.data-table tr.day-row.expanded .row-chevron { transform: rotate(90deg); }
+.data-table tr.day-detail-row { display: none; }
+.data-table tr.day-detail-row.open { display: table-row; }
+.data-table tr.day-detail-row td {
+  background: var(--surface-2);
+  white-space: normal;
+  padding: .75rem .875rem;
+}
+.data-table-nested { font-size: 12px; }
+
 /* Flags */
 .flag {
   display: flex;

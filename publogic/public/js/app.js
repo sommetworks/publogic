@@ -962,6 +962,32 @@ dropZone.addEventListener('drop', e => {
 dropZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
 fileInput.addEventListener('change', e => handleFiles(e.target.files));
 
+// Daily sales & margin tables render a hidden discount-breakdown row under
+// any day that has one (see periodSummaryHTML/discountMiniTableHTML below).
+// One delegated listener on the persistent results container handles every
+// venue's every store's table, present and future — results-panel's content
+// is fully replaced per analysis (container.innerHTML = ''), but the
+// container element itself never changes, so this never needs re-attaching.
+document.getElementById('venue-results').addEventListener('click', e => {
+  const row = e.target.closest('tr.day-row.expandable');
+  if (!row) return;
+  const detail = row.nextElementSibling;
+  if (!detail || !detail.classList.contains('day-detail-row')) return;
+  const nowOpen = row.classList.toggle('expanded');
+  detail.classList.toggle('open', nowOpen);
+  row.setAttribute('aria-expanded', String(nowOpen));
+});
+// Enter/Space on a focused expandable row works the same as a click — the
+// rows are real <tr>s with tabindex/role="button", not <button>s, which
+// don't get native key handling for free.
+document.getElementById('venue-results').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const row = e.target.closest('tr.day-row.expandable');
+  if (!row) return;
+  e.preventDefault();
+  row.click();
+});
+
 /* ── Aggregation ─────────────────────────────────────────────────────────── */
 // Turns a set of {date,total,hourly} day entries into every derived stat the
 // UI needs — used both for a venue's headline category and for individual
@@ -1460,6 +1486,30 @@ function productTotalsHTML(entries, storeLabel) {
 // flagging — only genuine short/over discrepancies surface as a warning.
 const TILL_VARIANCE_THRESHOLD = 5;
 
+// A single day's slice of the same Discount Totals data discountBreakdownHTML
+// rolls up over the whole period — same ranked reason/qty/amount shape, just
+// scoped to the one day a Daily Sales & Margin row is expanded for, so "what
+// made up the discounts on 5 Aug" has a real answer instead of only a
+// whole-period total.
+function discountMiniTableHTML(items, grossSales) {
+  const rows = items.slice().sort((a, b) => a.amount - b.amount); // most negative (biggest giveaway) first
+  const total = rows.reduce((s, r) => s + r.amount, 0);
+  const tableRows = rows.map(r => `
+    <tr>
+      <td>${r.label}</td>
+      <td class="num">${r.qty}</td>
+      <td class="num">${cur(r.amount)}</td>
+      <td class="num">${total !== 0 ? (r.amount / total * 100).toFixed(0) + '%' : '—'}</td>
+    </tr>`).join('');
+  const pctOfGross = grossSales ? Math.abs(total) / grossSales * 100 : null;
+  return `
+    <div class="metric-sub" style="margin-bottom:.5rem">${cur(Math.abs(total))} given away this day${pctOfGross !== null ? ` — ${pctOfGross.toFixed(1)}% of gross sales` : ''}</div>
+    <div class="data-table-wrap"><table class="data-table data-table-nested">
+      <thead><tr><th>Reason</th><th class="num">Qty</th><th class="num">Amount</th><th class="num">% of day's total</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>`;
+}
+
 function periodSummaryHTML(storeEntry) {
   const days = Object.values(storeEntry.byDate).sort((a, b) => b.date - a.date);
   if (!days.length) return '';
@@ -1470,9 +1520,17 @@ function periodSummaryHTML(storeEntry) {
     const flagged = d.difference !== null && Math.abs(d.difference) >= TILL_VARIANCE_THRESHOLD;
     const varCell = d.difference === null ? '—' :
       `${cur(d.difference)}${flagged ? ' <span class="flag-icon" title="Counted ' + fmtMoney(d.drawerCounted) + ' vs theoretical ' + fmtMoney(d.drawerTheoretical) + '">⚠</span>' : ''}`;
-    return `
-    <tr>
-      <td>${fmtDate(d.date)}</td>
+    // Discount Totals is only available from an XLSX Period Summary (parseDiscounts
+    // returns null for PDF exports), and even then only when at least one reason
+    // actually fired that day — gate the whole expand affordance on real data
+    // being there rather than showing a dead toggle for an empty breakdown.
+    const items = d.discounts && d.discounts.items;
+    const hasDiscounts = !!(items && items.length);
+    const rowOpenAttrs = hasDiscounts ? ' class="day-row expandable" tabindex="0" role="button" aria-expanded="false"' : '';
+    const chevron = hasDiscounts ? '<span class="row-chevron">▸</span>' : '';
+    const mainRow = `
+    <tr${rowOpenAttrs}>
+      <td>${chevron}${fmtDate(d.date)}</td>
       <td class="num">${fmtMoney(d.grossSales)}</td>
       <td class="num">${fmtMoney(d.nettTotal)}</td>
       <td class="num">${fmtMoney(d.costOfSales)}</td>
@@ -1480,15 +1538,22 @@ function periodSummaryHTML(storeEntry) {
       <td class="num">${d.profitPct !== null ? d.profitPct.toFixed(0) + '%' : '—'}</td>
       <td class="num">${varCell}</td>
     </tr>`;
+    const detailRow = hasDiscounts ? `
+    <tr class="day-detail-row">
+      <td colspan="7">${discountMiniTableHTML(items, d.grossSales)}</td>
+    </tr>` : '';
+    return mainRow + detailRow;
   }).join('');
 
   const flaggedDays = days.filter(d => d.difference !== null && Math.abs(d.difference) >= TILL_VARIANCE_THRESHOLD);
   const flags = flaggedDays.length
     ? `<div class="flag warn"><span class="flag-icon">⚠</span><span>${flaggedDays.length} day${flaggedDays.length === 1 ? '' : 's'} with a till variance of ${cur(TILL_VARIANCE_THRESHOLD)} or more: ${flaggedDays.map(d => `${fmtDate(d.date)} (${d.difference < 0 ? 'short' : 'over'} ${cur(Math.abs(d.difference))})`).join(', ')} — worth checking against the banking record</span></div>`
     : '';
+  const anyExpandable = days.some(d => d.discounts && d.discounts.items && d.discounts.items.length);
 
   return `<div class="result-card">
     <div class="card-label">Daily sales &amp; margin — ${storeEntry.label}</div>
+    ${anyExpandable ? '<div class="metric-sub" style="margin-bottom:.5rem">Click a day with discounts to see what made it up</div>' : ''}
     <div class="data-table-wrap"><table class="data-table">
       <thead><tr><th>Date</th><th class="num">Gross sales</th><th class="num">Nett sales</th><th class="num">Cost of sales</th><th class="num">Profit</th><th class="num">Margin</th><th class="num">Till variance</th></tr></thead>
       <tbody>${tableRows}</tbody>
