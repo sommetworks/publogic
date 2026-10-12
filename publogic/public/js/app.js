@@ -771,23 +771,26 @@ function parseStocktakePeriod(label) {
   return (isNaN(from.getTime()) || isNaN(to.getTime())) ? null : { from, to };
 }
 
+function findStocktakeHeaderIdx(rows) {
+  return rows.findIndex(r =>
+    String(r[0] || '').trim().toLowerCase() === 'item name' &&
+    r.some(c => /pour/i.test(String(c || '')) && /cost/i.test(String(c || ''))));
+}
+
 function detectStocktakeSheet(workbook) {
   if (!workbook) return null;
   for (const sheetName of workbook.SheetNames) {
     const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: '', raw: false });
-    const headerIdx = rows.findIndex(r =>
-      String(r[0] || '').trim().toLowerCase() === 'item name' &&
-      r.some(c => /pour/i.test(String(c || '')) && /cost/i.test(String(c || ''))));
+    const headerIdx = findStocktakeHeaderIdx(rows);
     if (headerIdx >= 0) return { rows, headerIdx };
   }
   return null;
 }
 
-function parseStocktakeFile(workbook) {
-  const sheet = detectStocktakeSheet(workbook);
-  if (!sheet) return null;
-  const { rows, headerIdx } = sheet;
-
+// Shared by both the normal SheetJS-based path and the raw-ZIP fallback
+// below — everything after "we have a rows grid and know which row is the
+// header" is identical either way.
+function buildStocktakeFromRows(rows, headerIdx) {
   // Venue + fortnight live somewhere above the header row, in whichever
   // column the export tool used — scanned for shape (a date-range-shaped
   // cell, and the one other populated cell alongside it) rather than a
@@ -828,6 +831,215 @@ function parseStocktakeFile(workbook) {
   if (!grandTotal) return null; // never found a GRAND TOTAL row — not a complete/usable report
 
   return { venue, periodStart: period.from, periodEnd: period.to, groups, grandTotal };
+}
+
+function parseStocktakeFile(workbook) {
+  const sheet = detectStocktakeSheet(workbook);
+  if (!sheet) return null;
+  return buildStocktakeFromRows(sheet.rows, sheet.headerIdx);
+}
+
+/* ── Raw-ZIP fallback for Sculpture Hospitality stocktake files ───────────
+   Confirmed LIVE, in the deployed app's own browser console against a real
+   uploaded file: SheetJS 0.18.5 silently fails to resolve every single
+   shared string in these files — wb.Strings comes back the right LENGTH
+   (it reads the <sst count="..."> attribute fine) but every entry is an
+   empty object, even the simplest possible one ("Commodore Hotel", one
+   plain <t> with no rich-text runs at all). Root-caused by pulling the raw
+   XLSX apart: every <si> tag in sharedStrings.xml is written "<si >" — one
+   stray space before the closing angle bracket — instead of the standard
+   "<si>". Still perfectly valid XML (confirmed well-formed, correct
+   <dimension>, correct rels, correct content-types, correct cell refs),
+   but SheetJS's fast-path SST reader apparently needs an exact "<si>" and
+   just returns nothing for every entry when it doesn't match. Same general
+   story as the openpyxl failure found earlier (a `horizontal="start"`
+   alignment value outside openpyxl's strict enum, elsewhere in this same
+   export tool's XML) — a slightly-nonstandard-but-valid writer, not a
+   corrupt file, tripping up two different strict parsers in two different
+   ways. cdnjs (the only CDN this app loads from) mirrors SheetJS no newer
+   than 0.18.5 — confirmed live, no newer build to switch to.
+   This re-reads the SAME file's raw bytes directly — no SheetJS, no
+   external library — using the browser's built-in DecompressionStream for
+   the zip's Deflate compression, and a small regex-based XML reader that's
+   tolerant of the stray space. It's only ever reached once the normal
+   SheetJS path has already found nothing usable. Verified against all 8
+   real Commodore Hotel files: every row and cell this produces matches the
+   independently hand-verified correct figures exactly (venue, period,
+   every category's Used/Revenue/Pour Cost %, GRAND TOTAL).
+*/
+function readZipEntries(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const EOCD_SIG = 0x06054b50;
+  let eocdOffset = -1;
+  const minEOCD = 22;
+  for (let i = bytes.length - minEOCD; i >= 0 && i >= bytes.length - minEOCD - 65535; i--) {
+    if (dv.getUint32(i, true) === EOCD_SIG) { eocdOffset = i; break; }
+  }
+  if (eocdOffset < 0) return null;
+  const entryCount = dv.getUint16(eocdOffset + 10, true);
+  const cdOffset = dv.getUint32(eocdOffset + 16, true);
+  const entries = [];
+  let p = cdOffset;
+  const CD_SIG = 0x02014b50;
+  const td = new TextDecoder('utf-8');
+  for (let i = 0; i < entryCount; i++) {
+    if (dv.getUint32(p, true) !== CD_SIG) return null;
+    const method = dv.getUint16(p + 10, true);
+    const compSize = dv.getUint32(p + 20, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const commentLen = dv.getUint16(p + 32, true);
+    const localOffset = dv.getUint32(p + 42, true);
+    const name = td.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+    entries.push({ name, method, compSize, localOffset });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+async function inflateRawDeflate(compressedBytes) {
+  const ds = new DecompressionStream('deflate-raw');
+  const writer = ds.writable.getWriter();
+  writer.write(compressedBytes);
+  writer.close();
+  const chunks = [];
+  const reader = ds.readable.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const total = chunks.reduce((s, c) => s + c.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  chunks.forEach(c => { out.set(c, off); off += c.length; });
+  return out;
+}
+
+async function extractZipEntryText(bytes, entry) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const p = entry.localOffset;
+  const LOCAL_SIG = 0x04034b50;
+  if (dv.getUint32(p, true) !== LOCAL_SIG) return null;
+  const nameLen = dv.getUint16(p + 26, true);
+  const extraLen = dv.getUint16(p + 28, true);
+  const dataStart = p + 30 + nameLen + extraLen;
+  const compressed = bytes.subarray(dataStart, dataStart + entry.compSize);
+  let raw;
+  if (entry.method === 0) raw = compressed;
+  else if (entry.method === 8) raw = await inflateRawDeflate(compressed);
+  else return null; // unsupported zip compression method — give up gracefully
+  return new TextDecoder('utf-8').decode(raw);
+}
+
+function decodeXmlEntities(s) {
+  return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
+function parseSharedStringsXMLFallback(xml) {
+  const strings = [];
+  const siRe = /<si\b[^>]*\/>|<si\b[^>]*>([\s\S]*?)<\/si>/g;
+  let m;
+  while ((m = siRe.exec(xml))) {
+    const inner = m[1];
+    if (inner === undefined) { strings.push(''); continue; } // self-closing <si/> = empty string
+    let text = '';
+    const tRe = /<t\b[^>]*>([\s\S]*?)<\/t>|<t\b[^>]*\/>/g;
+    let tm;
+    while ((tm = tRe.exec(inner))) { text += tm[1] || ''; } // concatenates rich-text <r><t> runs
+    strings.push(decodeXmlEntities(text));
+  }
+  return strings;
+}
+
+function colLettersToIndex(letters) {
+  let n = 0;
+  for (let i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
+  return n - 1;
+}
+
+function parseSheetRowsXMLFallback(xml, sharedStrings) {
+  const rows = [];
+  // The self-closing alternative MUST come first, each with a lazy
+  // [^>]*? ahead of it — a greedy [^>]* before a plain '>' branch will
+  // match straight through a self-closing row's (or cell's) trailing '/'
+  // and silently merge it with whatever real row/cell follows, shifting
+  // every subsequent index by one while still looking superficially
+  // plausible. Caught this exact bug in testing against the real files —
+  // every one of them has a genuinely blank, self-closing row right above
+  // the header row.
+  const rowRe = /<row\b([^>]*?)\/>|<row\b([^>]*?)>([\s\S]*?)<\/row>/g;
+  let rm;
+  while ((rm = rowRe.exec(xml))) {
+    const attrs = rm[1] !== undefined ? rm[1] : rm[2];
+    const refMatch = /\br="(\d+)"/.exec(attrs);
+    if (!refMatch) continue;
+    const rowNum = parseInt(refMatch[1], 10);
+    const rowXml = rm[3] || '';
+    const cellRe = /<c\b([^>]*?)\/>|<c\b([^>]*?)>([\s\S]*?)<\/c>/g;
+    let cm;
+    const rowCells = [];
+    while ((cm = cellRe.exec(rowXml))) {
+      const cAttrs = cm[1] !== undefined ? cm[1] : cm[2];
+      const inner = cm[3] || '';
+      const cRefMatch = /\br="([A-Z]+)\d+"/.exec(cAttrs);
+      if (!cRefMatch) continue;
+      const colIdx = colLettersToIndex(cRefMatch[1]);
+      const typeMatch = /\bt="([^"]*)"/.exec(cAttrs);
+      const type = typeMatch ? typeMatch[1] : 'n';
+      let value = '';
+      if (type === 's') {
+        const vMatch = /<v\b[^>]*>([\s\S]*?)<\/v>/.exec(inner);
+        const idx = vMatch ? parseInt(vMatch[1], 10) : NaN;
+        value = (Number.isFinite(idx) && sharedStrings[idx] !== undefined) ? sharedStrings[idx] : '';
+      } else if (type === 'inlineStr') {
+        const tMatch = /<t\b[^>]*>([\s\S]*?)<\/t>/.exec(inner);
+        value = tMatch ? decodeXmlEntities(tMatch[1]) : '';
+      } else {
+        const vMatch = /<v\b[^>]*>([\s\S]*?)<\/v>/.exec(inner);
+        value = vMatch ? vMatch[1] : '';
+      }
+      rowCells.push({ col: colIdx, value });
+    }
+    const maxCol = rowCells.reduce((mx, c) => Math.max(mx, c.col), -1);
+    const arr = new Array(maxCol + 1).fill('');
+    rowCells.forEach(c => { arr[c.col] = c.value; });
+    rows[rowNum - 1] = arr;
+  }
+  const height = rows.length;
+  const width = rows.reduce((mx, r) => Math.max(mx, r ? r.length : 0), 0);
+  const out = [];
+  for (let i = 0; i < height; i++) {
+    const r = rows[i] ? rows[i].slice() : [];
+    while (r.length < width) r.push('');
+    out.push(r);
+  }
+  return out;
+}
+
+// Only reached when the normal SheetJS-based parseStocktakeFile finds
+// nothing. `buf` is the ArrayBuffer extractXLSXText already read for this
+// file (its `buf` return field) — not a second file read.
+async function parseStocktakeFileFallback(buf) {
+  if (!buf || typeof DecompressionStream === 'undefined') return null;
+  try {
+    const bytes = new Uint8Array(buf);
+    const entries = readZipEntries(bytes);
+    if (!entries) return null;
+    const sheetEntry = entries.find(e => /^xl\/worksheets\/sheet\d+\.xml$/i.test(e.name));
+    if (!sheetEntry) return null;
+    const sstEntry = entries.find(e => e.name === 'xl/sharedStrings.xml');
+    const sheetXml = await extractZipEntryText(bytes, sheetEntry);
+    if (!sheetXml) return null;
+    const sstXml = sstEntry ? await extractZipEntryText(bytes, sstEntry) : '';
+    const sharedStrings = sstXml ? parseSharedStringsXMLFallback(sstXml) : [];
+    const rows = parseSheetRowsXMLFallback(sheetXml, sharedStrings);
+    const headerIdx = findStocktakeHeaderIdx(rows);
+    if (headerIdx < 0) return null;
+    return buildStocktakeFromRows(rows, headerIdx);
+  } catch (e) {
+    return null; // never let a fallback-parsing bug break the main ingestion loop
+  }
 }
 
 /* ── Daily Period Summary parsing ────────────────────────────────────────── */
@@ -990,7 +1202,7 @@ async function extractXLSXText(file) {
       });
     });
   });
-  return { text: out, workbook: wb };
+  return { text: out, workbook: wb, buf };
 }
 
 /* ── Hourly parsing ──────────────────────────────────────────────────────── */
@@ -2139,7 +2351,7 @@ async function runAnalysis() {
     setProgress(pct, `Reading file ${i + 1} of ${allFiles.length}`, f.name.slice(0, 50));
     if (i % 5 === 0) await new Promise(r => setTimeout(r, 0)); // keep UI responsive
 
-    let text, xlsxWorkbook = null;
+    let text, xlsxWorkbook = null, xlsxBuf = null;
     try {
       if (f.name.toLowerCase().endsWith('.pdf')) {
         text = await extractPDFText(f);
@@ -2147,6 +2359,7 @@ async function runAnalysis() {
         const r = await extractXLSXText(f);
         text = r.text;
         xlsxWorkbook = r.workbook; // needed for parseDiscounts below, and for roster detection
+        xlsxBuf = r.buf; // raw bytes, kept for parseStocktakeFileFallback if the normal SheetJS parse below finds nothing
       }
     } catch (e) {
       failed++;
@@ -2177,7 +2390,14 @@ async function runAnalysis() {
     // normal venues[] map via resolveVenueKey rather than kept in a separate
     // name-keyed bucket like roster rows are.
     if (xlsxWorkbook) {
-      const stocktake = parseStocktakeFile(xlsxWorkbook);
+      // The normal SheetJS-based parse fails outright on some real-world
+      // Sculpture Hospitality exports (confirmed live: SheetJS 0.18.5 can't
+      // resolve shared strings in files written with a stray-space "<si >"
+      // tag — see parseStocktakeFileFallback's comment) — falls back to a
+      // raw-ZIP reader of the same file's bytes when that happens, rather
+      // than silently losing the file to "no trading date found".
+      let stocktake = parseStocktakeFile(xlsxWorkbook);
+      if (!stocktake && xlsxBuf) stocktake = await parseStocktakeFileFallback(xlsxBuf);
       if (stocktake) {
         const vKey = resolveVenueKey(venues, stocktake.venue);
         venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {}, stockLoss: [], tableWriteoffs: [], bulkBeer: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {} };
