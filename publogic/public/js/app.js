@@ -719,6 +719,117 @@ function isManagerRole(role) {
   return /manager|supervisor|duty mgr/i.test(role || '');
 }
 
+/* ── Beverage stocktake parsing (Sculpture Hospitality) ──────────────────── */
+// Sculpture Hospitality's fortnightly "Summary Accounting Report" is a
+// physical-count-derived cost report, not a Bepoz export at all — no
+// Venue:/Store: fields, just the venue name and date-range sitting as plain
+// text wherever the export tool put them (column G, rows 1-2, on every real
+// Commodore Hotel file seen so far), above a single "Summary" sheet shaped
+// like:
+//   Item Name | Prev. On-Hand (cost) | Purchases (cost) | On-Hand (cost) |
+//   Used (cost) | Revenue | Pour Cost
+// with bare category-group header rows ("Liquor", "Wine", ...), per-category
+// line-item rows ("GIN:", "VODKA:", ...), a "Total <Group>:" subtotal row
+// closing each group, and one final "GRAND TOTAL" row. "Used (cost)" is
+// Prev On-Hand + Purchases − On-Hand — i.e. actual physical depletion since
+// the last count, not a sales-derived estimate — so Pour Cost % (Used ÷
+// Revenue) is a physically-verified COGS%, independent of whatever cost
+// data is (or isn't) entered in Bepoz. Every numeric cell here is stored as
+// pre-formatted text ("$13,965.06", "35.4%"), confirmed from the raw XLSX
+// (shared-string cell type), not a number+format — so these are always
+// parsed by stripping punctuation, the same as Bepoz's own Totals rows.
+function stocktakeMoney(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = parseFloat(String(v).replace(/[$,]/g, '').trim());
+  return Number.isFinite(n) ? n : null;
+}
+function stocktakePct(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = parseFloat(String(v).replace('%', '').trim());
+  return Number.isFinite(n) ? n : null;
+}
+
+const STOCKTAKE_MONTH_ABBR = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+// "Jun 9 to Jun 22 2026" — a single trailing year applies to both ends
+// unless the range crosses a year boundary (e.g. "Dec 29 to Jan 11 2027"),
+// in which case the start month comes chronologically after the end month
+// and belongs to the year before the one printed. None of the real
+// Commodore files seen so far cross a year boundary, so this branch is
+// written defensively but not yet exercised against a real example —
+// worth re-checking the first time a Dec/Jan file actually shows up.
+function parseStocktakePeriod(label) {
+  const m = String(label || '').trim()
+    .match(/^([A-Za-z]{3,9})\s+(\d{1,2})\s+to\s+([A-Za-z]{3,9})\s+(\d{1,2})\s+(\d{4})$/i);
+  if (!m) return null;
+  const fromMo = STOCKTAKE_MONTH_ABBR[m[1].slice(0, 3).toLowerCase()];
+  const toMo = STOCKTAKE_MONTH_ABBR[m[3].slice(0, 3).toLowerCase()];
+  if (fromMo === undefined || toMo === undefined) return null;
+  const endYear = parseInt(m[5], 10);
+  const startYear = fromMo > toMo ? endYear - 1 : endYear;
+  const from = new Date(startYear, fromMo, parseInt(m[2], 10));
+  const to = new Date(endYear, toMo, parseInt(m[4], 10));
+  return (isNaN(from.getTime()) || isNaN(to.getTime())) ? null : { from, to };
+}
+
+function detectStocktakeSheet(workbook) {
+  if (!workbook) return null;
+  for (const sheetName of workbook.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: '', raw: false });
+    const headerIdx = rows.findIndex(r =>
+      String(r[0] || '').trim().toLowerCase() === 'item name' &&
+      r.some(c => /pour/i.test(String(c || '')) && /cost/i.test(String(c || ''))));
+    if (headerIdx >= 0) return { rows, headerIdx };
+  }
+  return null;
+}
+
+function parseStocktakeFile(workbook) {
+  const sheet = detectStocktakeSheet(workbook);
+  if (!sheet) return null;
+  const { rows, headerIdx } = sheet;
+
+  // Venue + fortnight live somewhere above the header row, in whichever
+  // column the export tool used — scanned for shape (a date-range-shaped
+  // cell, and the one other populated cell alongside it) rather than a
+  // fixed address, since there's no Venue:/Store: label to anchor on.
+  let venue = null, period = null;
+  for (let r = 0; r < headerIdx; r++) {
+    for (const raw of (rows[r] || [])) {
+      const cell = String(raw || '').trim();
+      if (!cell) continue;
+      const p = parseStocktakePeriod(cell);
+      if (p) period = p;
+      else if (!venue) venue = cell;
+    }
+  }
+  if (!venue || !period) return null; // doesn't look like a usable stocktake report
+
+  const groups = [];
+  let current = null;
+  let grandTotal = null;
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const label = String(r[0] || '').trim();
+    if (!label) continue;
+    const figures = {
+      prevOnHand: stocktakeMoney(r[1]), purchases: stocktakeMoney(r[2]), onHand: stocktakeMoney(r[3]),
+      used: stocktakeMoney(r[4]), revenue: stocktakeMoney(r[5]), pourCostPct: stocktakePct(r[6]),
+    };
+
+    if (/^grand total$/i.test(label)) { grandTotal = figures; continue; }
+    if (/^total\s/i.test(label)) { if (current) current.subtotal = figures; continue; }
+
+    const restEmpty = r.slice(1, 7).every(v => String(v || '').trim() === '');
+    if (restEmpty) { current = { group: label, categories: [] }; groups.push(current); continue; }
+
+    if (!current) { current = { group: 'Other', categories: [] }; groups.push(current); }
+    current.categories.push({ name: label.replace(/:\s*$/, ''), ...figures });
+  }
+  if (!grandTotal) return null; // never found a GRAND TOTAL row — not a complete/usable report
+
+  return { venue, periodStart: period.from, periodEnd: period.to, groups, grandTotal };
+}
+
 /* ── Daily Period Summary parsing ────────────────────────────────────────── */
 // Bepoz's Period Summary export lays four independent tables (Stock, Sales,
 // Discount, Product Sortgroup) out side by side in one sheet. Flattening
@@ -1498,6 +1609,101 @@ function productTotalsHTML(entries, storeLabel) {
   </div>`;
 }
 
+/* ── Beverage stocktake rendering (Sculpture Hospitality) ────────────────── */
+// "Used (cost)" from parseStocktakeFile is a PHYSICAL stock count figure
+// (opening + purchases − closing), not derived from Bepoz's own recorded
+// cost-of-sales — it's an independent cross-check on beverage COGS, useful
+// in its own right even before any Bepoz cross-referencing is built. Pour
+// Cost % (Used ÷ Revenue, read straight off Sculpture's own report, not
+// recomputed here) is lower-is-better, the opposite sense to the
+// Margin-%/Profit-% figures elsewhere in this file — kept as its own
+// section rather than forced into the existing margin tables.
+function stocktakeShortDate(d) { return d.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' }); }
+function stocktakePeriodLabel(p) { return `${stocktakeShortDate(p.periodStart)} – ${stocktakeShortDate(p.periodEnd)}`; }
+
+// One horizontal bar per uploaded fortnight, colour-coded against this
+// venue's OWN blended average across every fortnight it has uploaded —
+// deliberately not against any invented "industry standard" pour-cost
+// number, consistent with how every other flag in this file is scoped to
+// the venue's own data.
+function stocktakeTrendHTML(periods, avgPct) {
+  const pcts = periods.map(p => p.grandTotal.pourCostPct || 0);
+  const maxPct = Math.max(...pcts);
+  return periods.map(p => {
+    const pct = p.grandTotal.pourCostPct || 0;
+    const w = maxPct > 0 ? Math.round(pct / maxPct * 100) : 0;
+    const clr = pct > avgPct + 6 ? '#DC2626' : pct > avgPct + 2 ? '#D97706' : '#0F766E';
+    const tc = w > 32 ? 'white' : 'var(--ink-mid)';
+    return `<div class="dow-row">
+      <span class="dow-label stocktake-label">${stocktakePeriodLabel(p)}</span>
+      <div class="dow-track">
+        <div class="dow-fill" style="width:${w}%;background:${clr}">
+          <span style="color:${tc}">${pct.toFixed(1)}%</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function stocktakeHTML(stocktakeByPeriod) {
+  const periods = Object.values(stocktakeByPeriod || {})
+    .filter(p => p.grandTotal && p.grandTotal.pourCostPct != null)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  if (!periods.length) return '';
+
+  const latest = periods[periods.length - 1];
+  const avgPct = periods.reduce((s, p) => s + p.grandTotal.pourCostPct, 0) / periods.length;
+
+  const latestCats = latest.groups.flatMap(g => g.categories.map(c => ({ ...c, group: g.group })))
+    .filter(c => c.revenue != null && c.pourCostPct != null);
+  const rankedCats = latestCats.slice().sort((a, b) => b.pourCostPct - a.pourCostPct);
+
+  const tableRows = rankedCats.map(c => `
+    <tr>
+      <td>${c.name}</td>
+      <td>${c.group}</td>
+      <td class="num">${cur(c.used)}</td>
+      <td class="num">${cur(c.revenue)}</td>
+      <td class="num">${c.pourCostPct.toFixed(1)}%</td>
+    </tr>`).join('');
+
+  // Flags: categories materially above this venue's own blended average
+  // (never below ~1% of the fortnight's revenue, so a near-zero-revenue
+  // garnish line with a noisy ratio doesn't trigger a flag), plus a
+  // fortnight-over-fortnight trend callout once there are at least 2
+  // fortnights to compare.
+  const flags = [];
+  const high = rankedCats.filter(c => c.pourCostPct > avgPct + 10 && c.revenue > latest.grandTotal.revenue * 0.01);
+  if (high.length) {
+    flags.push(`<div class="flag warn"><span class="flag-icon">⚠</span><span>${high.map(c => `<strong>${c.name}</strong> (${c.pourCostPct.toFixed(0)}% pour cost)`).join(', ')} — well above this venue's own ${avgPct.toFixed(0)}% blended average across all uploaded fortnights, worth checking pours, wastage or pricing on these lines</span></div>`);
+  }
+  if (periods.length >= 2) {
+    const prev = periods[periods.length - 2];
+    const delta = latest.grandTotal.pourCostPct - prev.grandTotal.pourCostPct;
+    if (delta > 2) {
+      flags.push(`<div class="flag warn"><span class="flag-icon">↑</span><span>Overall pour cost rose from ${prev.grandTotal.pourCostPct.toFixed(1)}% (${stocktakePeriodLabel(prev)}) to ${latest.grandTotal.pourCostPct.toFixed(1)}% this fortnight</span></div>`);
+    } else if (delta < -2) {
+      flags.push(`<div class="flag good"><span class="flag-icon">↓</span><span>Overall pour cost improved from ${prev.grandTotal.pourCostPct.toFixed(1)}% (${stocktakePeriodLabel(prev)}) to ${latest.grandTotal.pourCostPct.toFixed(1)}% this fortnight</span></div>`);
+    }
+  }
+
+  return `<div class="result-card">
+    <div class="card-label">Beverage stocktake — pour cost % by fortnight${periods.length > 1 ? ` <span class="powered-by">${periods.length} fortnights uploaded</span>` : ''}</div>
+    <div>${stocktakeTrendHTML(periods, avgPct)}</div>
+    <div class="metric-sub">Physical stocktake data from Sculpture Hospitality, not Bepoz POS — Pour Cost % = Used (cost) ÷ Revenue, both read straight off the report</div>
+  </div>
+  <div class="result-card">
+    <div class="card-label">Beverage stocktake — by category, fortnight of ${stocktakePeriodLabel(latest)}</div>
+    <div class="metric-value">${latest.grandTotal.pourCostPct.toFixed(1)}%</div>
+    <div class="metric-sub">Overall pour cost · ${cur(latest.grandTotal.used)} used on ${cur(latest.grandTotal.revenue)} revenue</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Category</th><th>Group</th><th class="num">Used (cost)</th><th class="num">Revenue</th><th class="num">Pour cost %</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+    ${flags.join('')}
+  </div>`;
+}
+
 /* ── Daily Period Summary rendering ──────────────────────────────────────── */
 // A till variance under $5 is normal float/rounding noise, not worth
 // flagging — only genuine short/over discrepancies surface as a warning.
@@ -1676,7 +1882,7 @@ function discountBreakdownHTML(storeEntry) {
 }
 
 /* ── Venue narrative prompt ──────────────────────────────────────────────── */
-function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary, rosterByName = {}) {
+function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary, rosterByName = {}, stocktakeByPeriod = {}) {
   const catLines = categoryStats.map(c =>
     `- ${CATEGORY_LABELS[c.key] || c.key}: total ${cur(c.stats.total)} over ${c.stats.days.length} days, daily avg ${cur(c.stats.avg)}`
   ).join('\n');
@@ -1833,10 +2039,34 @@ Hourly pattern is based on ${headlineLabel}:
     if (parts.length) periodSummarySection = `\n\nDaily Period Summary data:\n${parts.join('\n\n')}`;
   }
 
-  return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && (weeklySection || periodSummarySection) ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
-${dailySection}${weeklySection}${periodSummarySection}
+  // Sculpture Hospitality's fortnightly beverage stocktake — a physical
+  // stock count, independent of Bepoz's own POS/cost data (see
+  // stocktakeHTML's comment). Only the latest fortnight's category detail
+  // goes into the prompt, plus the trend across every fortnight uploaded so
+  // far, so the narrative can speak to direction of travel without the
+  // prompt growing per fortnight.
+  let stocktakeSection = '';
+  const stocktakePeriods = Object.values(stocktakeByPeriod || {})
+    .filter(p => p.grandTotal && p.grandTotal.pourCostPct != null)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  if (stocktakePeriods.length) {
+    const latest = stocktakePeriods[stocktakePeriods.length - 1];
+    const trendLine = stocktakePeriods.map(p => `${stocktakePeriodLabel(p)}: ${p.grandTotal.pourCostPct.toFixed(1)}%`).join(' | ');
+    // Same >1%-of-revenue floor used in stocktakeHTML's flags — without it
+    // the ranking is dominated by tiny, noisy lines (a $7 "Sundries" line at
+    // 109% pour cost isn't a real finding) rather than categories that
+    // actually move the venue's beverage cost.
+    const cats = latest.groups.flatMap(g => g.categories.map(c => ({ ...c, group: g.group })))
+      .filter(c => c.revenue != null && c.pourCostPct != null && c.revenue > latest.grandTotal.revenue * 0.01)
+      .sort((a, b) => b.pourCostPct - a.pourCostPct);
+    stocktakeSection = `\n\nBeverage stocktake (Sculpture Hospitality physical stock count — "Used" is actual stock depletion, not Bepoz's recorded cost of sales):\nOverall pour cost % by fortnight: ${trendLine}\nLatest fortnight (${stocktakePeriodLabel(latest)}) by category, worst pour cost first:\n` +
+      cats.slice(0, 10).map(c => `- ${c.name} (${c.group}): ${cur(c.used)} used on ${cur(c.revenue)} revenue, ${c.pourCostPct.toFixed(1)}% pour cost`).join('\n');
+  }
 
-Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), which departments are getting the most/least revenue per labour hour and whether rostering matches demand, category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, which discount reasons are giving away the most margin and whether that looks justified, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
+  return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && (weeklySection || periodSummarySection || stocktakeSection) ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
+${dailySection}${weeklySection}${periodSummarySection}${stocktakeSection}
+
+Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), which departments are getting the most/least revenue per labour hour and whether rostering matches demand, category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, which discount reasons are giving away the most margin and whether that looks justified, which beverage categories are running an unusually high physical pour cost vs this venue's own average and whether that's worth a wastage/pour-size/pricing check, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
 }
 
 async function streamBrief(prompt, targetEl) {
@@ -1901,6 +2131,7 @@ async function runAnalysis() {
   // are still being read, since roster files carry no Bepoz Venue/Store info.
   const rosterByName = {};
   let rosterFilesParsed = 0;
+  let stocktakeFilesParsed = 0;
 
   for (let i = 0; i < allFiles.length; i++) {
     const f = allFiles[i];
@@ -1939,6 +2170,25 @@ async function runAnalysis() {
       }
     }
 
+    // Sculpture Hospitality's fortnightly beverage stocktake report is the
+    // same situation as Staff Roster above — no Venue:/Store: field for
+    // classifyReport to key off at all — except this report DOES carry its
+    // own venue name (in a plain, unlabeled cell), so it's resolved into the
+    // normal venues[] map via resolveVenueKey rather than kept in a separate
+    // name-keyed bucket like roster rows are.
+    if (xlsxWorkbook) {
+      const stocktake = parseStocktakeFile(xlsxWorkbook);
+      if (stocktake) {
+        const vKey = resolveVenueKey(venues, stocktake.venue);
+        venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {}, stockLoss: [], tableWriteoffs: [], bulkBeer: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {} };
+        const periodId = `${dateKey(stocktake.periodStart)}_${dateKey(stocktake.periodEnd)}`;
+        venues[vKey].stocktake[periodId] = stocktake;
+        stocktakeFilesParsed++;
+        parsed++;
+        continue;
+      }
+    }
+
     const info = classifyReport(text);
     if (!info) {
       failed++;
@@ -1954,7 +2204,7 @@ async function runAnalysis() {
     // were five different WEEKS of one report — wrong "N weeks uploaded"
     // label, only one store's data ever shown, and multi-week totals that
     // silently sum different stores together as if summing weeks.
-    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {}, stockLoss: [], tableWriteoffs: [], bulkBeer: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0 };
+    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {}, stockLoss: [], tableWriteoffs: [], bulkBeer: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {} };
     const v = venues[vKey];
 
     if (info.category === 'period_summary') {
@@ -2135,7 +2385,8 @@ async function runAnalysis() {
   document.getElementById('results-meta').textContent =
     `${parsed} files parsed · ${failed > 0 ? failed + ' skipped' : 'all files read successfully'}` +
     (periodSummarySkipped > 0 ? ` · ${periodSummarySkipped} period summary file${periodSummarySkipped === 1 ? '' : 's'} seen (not yet charted)` : '') +
-    (rosterFilesParsed > 0 ? ` · ${rosterFilesParsed} roster file${rosterFilesParsed === 1 ? '' : 's'} loaded (${Object.keys(rosterByName).length} staff${rosterUnmatchedCount ? `, ${rosterUnmatchedCount} not found in any Staff Sales report` : ''})` : '');
+    (rosterFilesParsed > 0 ? ` · ${rosterFilesParsed} roster file${rosterFilesParsed === 1 ? '' : 's'} loaded (${Object.keys(rosterByName).length} staff${rosterUnmatchedCount ? `, ${rosterUnmatchedCount} not found in any Staff Sales report` : ''})` : '') +
+    (stocktakeFilesParsed > 0 ? ` · ${stocktakeFilesParsed} stocktake file${stocktakeFilesParsed === 1 ? '' : 's'} loaded` : '');
 
   const container = document.getElementById('venue-results');
   container.innerHTML = '';
@@ -2153,6 +2404,7 @@ async function runAnalysis() {
     const productMixStores = Object.keys(v.weekly.productMix);
     const hasWeekly = v.weekly.staffSales.length || v.weekly.cogs.length || productMixStores.length
       || v.weekly.stockLoss.length || v.weekly.tableWriteoffs.length || v.weekly.bulkBeer.length;
+    const hasStocktake = Object.keys(v.stocktake || {}).length > 0;
 
     const metricsHTML = catStats.length ? catStats.map(c => `
       <div class="metric-card">
@@ -2226,6 +2478,8 @@ async function runAnalysis() {
       .map(store => periodSummaryHTML(store) + discountBreakdownHTML(store))
       .join('');
 
+    const stocktakeSection = hasStocktake ? stocktakeHTML(v.stocktake) : '';
+
     const availableMonths = getAvailableMonths(v);
     const monthlyTriggerHTML = availableMonths.length ? `
       <div class="result-card monthly-trigger-card">
@@ -2249,6 +2503,7 @@ async function runAnalysis() {
       ${chartSection}
       ${weeklySection}
       ${periodSummarySection}
+      ${stocktakeSection}
       <div class="result-card brief-card">
         <div class="card-label">
           <span>AI ops narrative</span>
@@ -2286,8 +2541,8 @@ async function runAnalysis() {
       });
     }
 
-    if (primary || hasWeekly || hasPeriodSummary) {
-      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary, rosterByName);
+    if (primary || hasWeekly || hasPeriodSummary || hasStocktake) {
+      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary, rosterByName, v.stocktake);
       briefTargets.push({ prompt, el: section.querySelector(`#brief-${vslug}`) });
     } else {
       section.querySelector(`#brief-${vslug}`).textContent = 'Not enough category data for a narrative on this venue.';

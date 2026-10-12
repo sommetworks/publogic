@@ -547,6 +547,13 @@ body {
   white-space: nowrap;
 }
 
+/* Stocktake fortnight-trend bars reuse .dow-row/.dow-track/.dow-fill — only
+   the label needs its own width, since "9 Jun – 22 Jun" is wider than a
+   day-of-week name. */
+.stocktake-label {
+  width: 128px;
+}
+
 /* Heatmap */
 .heatmap-wrap { overflow-x: auto; }
 
