@@ -1268,7 +1268,10 @@ function updateSummary() {
     `venue and report type are read from each file's contents when you analyse`;
   document.getElementById('debug-line').textContent = '';
   showEl('file-summary');
-  document.getElementById('analyse-btn').disabled = allFiles.length === 0;
+  // Zero files is a valid thing to analyse now — uploads add to saved
+  // history rather than replacing it, so clicking with nothing newly
+  // selected just shows whatever's already been saved from past uploads.
+  document.getElementById('analyse-btn').disabled = false;
 }
 
 /* ── Drop zone ───────────────────────────────────────────────────────────── */
@@ -1284,6 +1287,21 @@ dropZone.addEventListener('drop', e => {
 });
 dropZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
 fileInput.addEventListener('change', e => handleFiles(e.target.files));
+
+const clearHistoryLink = document.getElementById('clear-history-link');
+if (clearHistoryLink) {
+  clearHistoryLink.addEventListener('click', async e => {
+    e.preventDefault();
+    if (!confirm('This permanently deletes all saved report history from the server — every venue, every period. New uploads will start from scratch. This cannot be undone. Continue?')) return;
+    try {
+      const res = await fetch('/api/clear-records', { method: 'POST' });
+      if (!res.ok) throw new Error(`clear-records returned ${res.status}`);
+      alert('Saved history cleared.');
+    } catch (e) {
+      alert(`Could not clear saved history: ${e.message}`);
+    }
+  });
+}
 
 // Daily sales & margin tables render a hidden discount-breakdown row under
 // any day that has one (see periodSummaryHTML/discountMiniTableHTML below),
@@ -2327,6 +2345,193 @@ async function streamBrief(prompt, targetEl) {
   }
 }
 
+/* ── Persisted report history (Cloudflare D1) ────────────────────────────────
+   Every upload used to be the WHOLE dataset — nothing survived between
+   sessions, so looking at more than one month meant re-selecting every file
+   you'd ever uploaded, every time. This layer persists each individually
+   ingested record (one day's category entry, one week's staff sales report,
+   one stocktake period, ...) to a small server-side table, keyed so that
+   re-uploading the same report overwrites its own row instead of duplicating
+   it. Each analysis run now: (1) loads every previously saved record and
+   replays it into a fresh in-memory venues/rosterByName state, (2) ingests
+   whatever new files were just dropped on TOP of that (new data wins on a
+   key collision, since it's applied after the replay), (3) saves the
+   resulting merged state back — so the server always ends up holding the
+   full history, and a completely empty upload just shows what's already
+   saved. Persistence is best-effort: a network hiccup here degrades back to
+   "this session's files only" rather than blocking the analysis.
+
+   Record shape: { venue, bucket, k1, k2, data }. `data` can be any JSON-
+   shaped value (object/array/primitive), including nested Date objects —
+   dateTag/dateUntag walk the whole structure so no bucket-specific
+   (de)serialisation code is needed. `bucket` + `k1` (+ `k2` where a second
+   level of keying applies, e.g. a date within a category) is the natural
+   idempotent key for that kind of record — see collectAllRecords/
+   applyRecord below for exactly how each report type maps onto it. */
+function newVenueBucket() {
+  return { categories: {}, subVenues: {}, weekly: { staffSales: {}, cogs: {}, productMix: {}, stockLoss: {}, tableWriteoffs: {}, bulkBeer: {} }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {} };
+}
+
+// field name on v.weekly  ->  persisted bucket name. productMix is handled
+// separately below since it's keyed by store as well as by week.
+const WEEKLY_BUCKETS = [
+  ['staffSales', 'weekly_staff_sales'],
+  ['cogs', 'weekly_cogs'],
+  ['stockLoss', 'weekly_stock_loss'],
+  ['tableWriteoffs', 'weekly_table_writeoffs'],
+  ['bulkBeer', 'weekly_bulk_beer'],
+];
+
+function dateTag(v) {
+  if (v instanceof Date) return { __date__: v.toISOString() };
+  if (Array.isArray(v)) return v.map(dateTag);
+  if (v && typeof v === 'object') {
+    const out = {};
+    Object.keys(v).forEach(k => { out[k] = dateTag(v[k]); });
+    return out;
+  }
+  return v;
+}
+function dateUntag(v) {
+  if (v && typeof v === 'object' && !Array.isArray(v) && typeof v.__date__ === 'string' && Object.keys(v).length === 1) {
+    return new Date(v.__date__);
+  }
+  if (Array.isArray(v)) return v.map(dateUntag);
+  if (v && typeof v === 'object') {
+    const out = {};
+    Object.keys(v).forEach(k => { out[k] = dateUntag(v[k]); });
+    return out;
+  }
+  return v;
+}
+
+// Replays ONE previously-saved record back into the same intermediate,
+// map-keyed shape fresh file ingestion builds during runAnalysis (weekly
+// collections keyed by weekKey rather than plain arrays — see
+// finalizeWeeklyMaps) — so persisted history and this session's new files
+// merge through one consistent representation before rendering.
+function applyRecord(venues, rosterByName, rec) {
+  if (rec.bucket === 'roster') {
+    (rec.data || []).forEach(entry => {
+      const key = String(entry.name || '').toLowerCase().trim();
+      if (!key) return;
+      (rosterByName[key] = rosterByName[key] || []).push(entry);
+    });
+    return;
+  }
+  const v = venues[rec.venue] = venues[rec.venue] || newVenueBucket();
+  if (rec.bucket === 'category') {
+    v.categories[rec.k1] = v.categories[rec.k1] || { byDate: {} };
+    v.categories[rec.k1].byDate[rec.k2] = rec.data;
+    return;
+  }
+  if (rec.bucket === 'subvenue') {
+    v.subVenues[rec.k1] = v.subVenues[rec.k1] || { label: rec.data.label, category: rec.data.category, byDate: {} };
+    v.subVenues[rec.k1].byDate[rec.k2] = rec.data;
+    return;
+  }
+  if (rec.bucket === 'period_summary') {
+    v.periodSummary[rec.k1] = v.periodSummary[rec.k1] || { label: rec.k1, byDate: {} };
+    v.periodSummary[rec.k1].byDate[rec.k2] = rec.data;
+    return;
+  }
+  if (rec.bucket === 'weekly_product_mix') {
+    v.weekly.productMix[rec.k1] = v.weekly.productMix[rec.k1] || {};
+    v.weekly.productMix[rec.k1][rec.k2] = rec.data;
+    return;
+  }
+  if (rec.bucket === 'stocktake') {
+    v.stocktake[rec.k1] = rec.data;
+    return;
+  }
+  const weeklyField = WEEKLY_BUCKETS.find(([, bucket]) => bucket === rec.bucket);
+  if (weeklyField) {
+    v.weekly[weeklyField[0]][rec.k1] = rec.data;
+  }
+}
+
+// Converts this run's map-keyed weekly collections (used during ingestion so
+// a repeated week/store overwrites instead of duplicating) into the plain
+// arrays every rendering function downstream already expects — run once,
+// right after persisted history and fresh files have both been merged in,
+// so nothing below this point needs to know the merge happened at all.
+function finalizeWeeklyMaps(venues) {
+  Object.values(venues).forEach(v => {
+    WEEKLY_BUCKETS.forEach(([field]) => { v.weekly[field] = Object.values(v.weekly[field]); });
+    Object.keys(v.weekly.productMix).forEach(storeKey => {
+      v.weekly.productMix[storeKey] = Object.values(v.weekly.productMix[storeKey]);
+    });
+  });
+}
+
+// Walks the FINAL merged venues/rosterByName state and reconstructs the full
+// flat list of persistable records — rather than tracking "what changed"
+// during ingestion, every save just re-derives the complete current state
+// and upserts all of it. At this app's scale that's a trivial number of
+// rows, and it's self-healing: whatever the final state is, that's what
+// gets saved, with no separate bookkeeping to drift out of sync. Call AFTER
+// finalizeWeeklyMaps, since it reads the flattened array shape.
+function collectAllRecords(venues, rosterByName) {
+  const records = [];
+  Object.entries(venues).forEach(([venueName, v]) => {
+    Object.entries(v.categories).forEach(([cat, c]) => {
+      Object.entries(c.byDate).forEach(([dk, entry]) => {
+        records.push({ venue: venueName, bucket: 'category', k1: cat, k2: dk, data: entry });
+      });
+    });
+    Object.entries(v.subVenues).forEach(([key, sv]) => {
+      Object.entries(sv.byDate).forEach(([dk, entry]) => {
+        records.push({ venue: venueName, bucket: 'subvenue', k1: key, k2: dk, data: { ...entry, label: sv.label, category: sv.category } });
+      });
+    });
+    Object.entries(v.periodSummary).forEach(([storeKey, store]) => {
+      Object.entries(store.byDate).forEach(([dk, entry]) => {
+        records.push({ venue: venueName, bucket: 'period_summary', k1: storeKey, k2: dk, data: entry });
+      });
+    });
+    WEEKLY_BUCKETS.forEach(([field, bucket]) => {
+      v.weekly[field].forEach(entry => {
+        records.push({ venue: venueName, bucket, k1: `${dateKey(entry.weekStart)}_${dateKey(entry.weekEnd)}`, k2: '', data: entry });
+      });
+    });
+    Object.entries(v.weekly.productMix).forEach(([storeKey, entries]) => {
+      entries.forEach(entry => {
+        records.push({ venue: venueName, bucket: 'weekly_product_mix', k1: storeKey, k2: `${dateKey(entry.weekStart)}_${dateKey(entry.weekEnd)}`, data: entry });
+      });
+    });
+    Object.entries(v.stocktake).forEach(([periodId, entry]) => {
+      records.push({ venue: venueName, bucket: 'stocktake', k1: periodId, k2: '', data: entry });
+    });
+  });
+  const rosterFlat = Object.values(rosterByName).flat();
+  if (rosterFlat.length) {
+    records.push({ venue: '__global__', bucket: 'roster', k1: 'all', k2: '', data: rosterFlat });
+  }
+  return records;
+}
+
+async function loadPersistedRecords() {
+  const res = await fetch('/api/load-records');
+  if (!res.ok) throw new Error(`load-records returned ${res.status}`);
+  const body = await res.json();
+  const rows = Array.isArray(body.records) ? body.records : [];
+  return rows.map(row => ({
+    venue: row.venue, bucket: row.bucket, k1: row.k1, k2: row.k2,
+    data: dateUntag(JSON.parse(row.data)),
+  }));
+}
+
+async function saveRecordsToServer(records) {
+  if (!records.length) return;
+  const payload = records.map(r => ({ venue: r.venue, bucket: r.bucket, k1: r.k1, k2: r.k2, data: JSON.stringify(dateTag(r.data)) }));
+  const res = await fetch('/api/save-records', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records: payload }),
+  });
+  if (!res.ok) throw new Error(`save-records returned ${res.status}`);
+}
+
 /* ── Main analysis ───────────────────────────────────────────────────────── */
 async function runAnalysis() {
   document.getElementById('analyse-btn').disabled = true;
@@ -2343,7 +2548,16 @@ async function runAnalysis() {
   // are still being read, since roster files carry no Bepoz Venue/Store info.
   const rosterByName = {};
   let rosterFilesParsed = 0;
+  let rosterResetDone = false;
   let stocktakeFilesParsed = 0;
+
+  setProgress(2, 'Loading saved history...', '');
+  try {
+    const persisted = await loadPersistedRecords();
+    persisted.forEach(rec => applyRecord(venues, rosterByName, rec));
+  } catch (e) {
+    console.warn('Could not load saved report history — showing this upload only:', e.message);
+  }
 
   for (let i = 0; i < allFiles.length; i++) {
     const f = allFiles[i];
@@ -2373,6 +2587,17 @@ async function runAnalysis() {
     if (xlsxWorkbook) {
       const rosterRows = parseRosterRows(xlsxWorkbook);
       if (rosterRows && rosterRows.length) {
+        // A fresh roster upload is a new snapshot, not an addition — if
+        // someone's left, re-uploading the template should drop them, not
+        // leave them stuck in the saved history forever. So the FIRST
+        // roster file in this run wipes whatever was replayed in from
+        // persisted history before any of this run's rows go in; a second
+        // roster file in the same run (e.g. one per venue) still adds to it
+        // normally.
+        if (!rosterResetDone) {
+          Object.keys(rosterByName).forEach(k => delete rosterByName[k]);
+          rosterResetDone = true;
+        }
         rosterRows.forEach(row => {
           const key = row.name.toLowerCase();
           (rosterByName[key] = rosterByName[key] || []).push(row);
@@ -2400,7 +2625,7 @@ async function runAnalysis() {
       if (!stocktake && xlsxBuf) stocktake = await parseStocktakeFileFallback(xlsxBuf);
       if (stocktake) {
         const vKey = resolveVenueKey(venues, stocktake.venue);
-        venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {}, stockLoss: [], tableWriteoffs: [], bulkBeer: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {} };
+        venues[vKey] = venues[vKey] || newVenueBucket();
         const periodId = `${dateKey(stocktake.periodStart)}_${dateKey(stocktake.periodEnd)}`;
         venues[vKey].stocktake[periodId] = stocktake;
         stocktakeFilesParsed++;
@@ -2424,7 +2649,7 @@ async function runAnalysis() {
     // were five different WEEKS of one report — wrong "N weeks uploaded"
     // label, only one store's data ever shown, and multi-week totals that
     // silently sum different stores together as if summing weeks.
-    venues[vKey] = venues[vKey] || { categories: {}, subVenues: {}, weekly: { staffSales: [], cogs: [], productMix: {}, stockLoss: [], tableWriteoffs: [], bulkBeer: [] }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {} };
+    venues[vKey] = venues[vKey] || newVenueBucket();
     const v = venues[vKey];
 
     if (info.category === 'period_summary') {
@@ -2472,7 +2697,12 @@ async function runAnalysis() {
           failureSamples.push(`${f.name}: recognised as "${info.title}" but couldn't parse any rows`);
           continue;
         }
-        v.weekly.bulkBeer.push({ weekStart: range.from, weekEnd: range.to, rows });
+        // Keyed by week (rather than pushed to an array) so re-uploading the
+        // same week's file — either later in this same batch or via
+        // persisted history replayed in above — overwrites that week's
+        // entry instead of duplicating it. Flattened back to a plain array
+        // for rendering by finalizeWeeklyMaps once ingestion is done.
+        v.weekly.bulkBeer[`${dateKey(range.from)}_${dateKey(range.to)}`] = { weekStart: range.from, weekEnd: range.to, rows };
         parsed++;
         continue;
       }
@@ -2483,7 +2713,7 @@ async function runAnalysis() {
         continue;
       }
       const bucket = info.category === 'stock_loss' ? v.weekly.stockLoss : v.weekly.tableWriteoffs;
-      bucket.push({ weekStart: range.from, weekEnd: range.to, data });
+      bucket[`${dateKey(range.from)}_${dateKey(range.to)}`] = { weekStart: range.from, weekEnd: range.to, data };
       parsed++;
       continue;
     }
@@ -2513,10 +2743,11 @@ async function runAnalysis() {
         continue;
       }
       const entry = { weekStart: range.from, weekEnd: range.to, rows };
+      const weekKey = `${dateKey(range.from)}_${dateKey(range.to)}`;
       if (info.category === 'staff_sales') {
-        v.weekly.staffSales.push(entry);
+        v.weekly.staffSales[weekKey] = entry;
       } else if (info.category === 'cogs') {
-        v.weekly.cogs.push(entry);
+        v.weekly.cogs[weekKey] = entry;
       } else {
         // A store can have more than one weekly Product Summary report
         // family — Harbord Hotel runs a "Food" product summary (different
@@ -2530,8 +2761,8 @@ async function runAnalysis() {
         // same "food" signal classifyReport already uses for daily reports.
         const store = (info.store || info.venue || 'All Stores').trim();
         const storeKey = /food/i.test(info.title) ? `${store} (Food)` : store;
-        v.weekly.productMix[storeKey] = v.weekly.productMix[storeKey] || [];
-        v.weekly.productMix[storeKey].push(entry);
+        v.weekly.productMix[storeKey] = v.weekly.productMix[storeKey] || {};
+        v.weekly.productMix[storeKey][weekKey] = entry;
       }
       parsed++;
       continue;
@@ -2565,14 +2796,19 @@ async function runAnalysis() {
     parsed++;
   }
 
-  setProgress(90, 'Aggregating patterns...', '');
+  setProgress(88, 'Aggregating patterns...', '');
   await new Promise(r => setTimeout(r, 50));
+
+  // Done ingesting — flatten the week-keyed collections (used so a repeated
+  // week overwrites rather than duplicates) back into the plain arrays every
+  // rendering function below already expects.
+  finalizeWeeklyMaps(venues);
 
   // Roster names never seen in ANY uploaded Staff Sales report (any venue,
   // any week) — surfaced as a count rather than silently dropped, same as
   // every other unmatched/unparseable case in this loop.
   let rosterUnmatchedCount = 0;
-  if (rosterFilesParsed > 0) {
+  if (Object.keys(rosterByName).length > 0) {
     const allStaffNames = new Set();
     Object.values(venues).forEach(v => {
       v.weekly.staffSales.forEach(week => week.rows.forEach(r => allStaffNames.add(r.name.toLowerCase().trim())));
@@ -2582,14 +2818,34 @@ async function runAnalysis() {
 
   const venueNames = Object.keys(venues);
 
-  if (venueNames.length === 0 || parsed === 0) {
-    const detail = failureSamples.slice(0, 3).map(s => `<br>• ${s}`).join('');
-    document.getElementById('error-msg').innerHTML =
-      `Parsed ${parsed} valid files from ${allFiles.length} uploaded. ${detail}`;
+  // venueNames now reflects persisted history too, so an upload that only
+  // adds a roster file (or nothing at all) on top of an already-saved
+  // history correctly falls through to rendering rather than erroring —
+  // there's no history AND nothing usable was parsed this run only when
+  // venueNames is actually empty.
+  if (venueNames.length === 0) {
+    let msg;
+    if (allFiles.length === 0) {
+      msg = `No files uploaded and no saved history yet — drop your report files above, then click Generate analysis.`;
+    } else {
+      const detail = failureSamples.slice(0, 3).map(s => `<br>• ${s}`).join('');
+      msg = `Parsed ${parsed} valid files from ${allFiles.length} uploaded. ${detail}`;
+    }
+    document.getElementById('error-msg').innerHTML = msg;
     showEl('error-msg');
     hideEl('progress-wrap');
     document.getElementById('analyse-btn').disabled = false;
     return;
+  }
+
+  setProgress(94, 'Saving to history...', '');
+  const allRecords = collectAllRecords(venues, rosterByName);
+  let historySaved = true;
+  try {
+    await saveRecordsToServer(allRecords);
+  } catch (e) {
+    historySaved = false;
+    console.warn('Could not save report history — this upload will still render, but may need re-uploading next time:', e.message);
   }
 
   setProgress(100, 'Building report...', '');
@@ -2603,10 +2859,11 @@ async function runAnalysis() {
   document.getElementById('results-title').textContent =
     `${venueNames.length} venue${venueNames.length === 1 ? '' : 's'} analysed`;
   document.getElementById('results-meta').textContent =
-    `${parsed} files parsed · ${failed > 0 ? failed + ' skipped' : 'all files read successfully'}` +
+    `${allFiles.length ? `${parsed} new file${parsed === 1 ? '' : 's'} parsed this upload` : 'No new files this upload'} · ${allRecords.length} report-period${allRecords.length === 1 ? '' : 's'} saved in total across all venues` +
+    (failed > 0 ? ` · ${failed} skipped` : '') +
     (periodSummarySkipped > 0 ? ` · ${periodSummarySkipped} period summary file${periodSummarySkipped === 1 ? '' : 's'} seen (not yet charted)` : '') +
-    (rosterFilesParsed > 0 ? ` · ${rosterFilesParsed} roster file${rosterFilesParsed === 1 ? '' : 's'} loaded (${Object.keys(rosterByName).length} staff${rosterUnmatchedCount ? `, ${rosterUnmatchedCount} not found in any Staff Sales report` : ''})` : '') +
-    (stocktakeFilesParsed > 0 ? ` · ${stocktakeFilesParsed} stocktake file${stocktakeFilesParsed === 1 ? '' : 's'} loaded` : '');
+    (Object.keys(rosterByName).length > 0 ? ` · roster loaded (${Object.keys(rosterByName).length} staff${rosterUnmatchedCount ? `, ${rosterUnmatchedCount} not found in any Staff Sales report` : ''})` : '') +
+    (historySaved ? '' : ' · could not save this upload to history — it rendered from this session only, you may need to re-upload it later');
 
   const container = document.getElementById('venue-results');
   container.innerHTML = '';
@@ -3160,6 +3417,6 @@ function resetApp() {
   hideEl('progress-wrap');
   hideEl('results-panel');
   showEl('upload-panel');
-  document.getElementById('analyse-btn').disabled = true;
+  document.getElementById('analyse-btn').disabled = false; // saved history may still have something to show with zero new files
   document.getElementById('venue-results').innerHTML = '';
 }
