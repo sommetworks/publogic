@@ -772,9 +772,235 @@ function parseStocktakePeriod(label) {
 }
 
 function findStocktakeHeaderIdx(rows) {
-  return rows.findIndex(r =>
-    String(r[0] || '').trim().toLowerCase() === 'item name' &&
-    r.some(c => /pour/i.test(String(c || '')) && /cost/i.test(String(c || ''))));
+  return rows.findIndex(r => {
+    if (String(r[0] || '').trim().toLowerCase() !== 'item name') return false;
+    const cells = r.map(c => String(c || '').toLowerCase());
+    // "Pour" + "Cost" together is this report's own signal, but the
+    // Detailed Variance Report ALSO has a "Pour Cost" column (see
+    // findVarianceHeaderIdx below) — excluding its two distinguishing
+    // columns here means a Variance Report file can never be misread as a
+    // Summary Accounting Report, even if detection order ever changes.
+    const hasPourCost = cells.some(c => /pour/.test(c) && /cost/.test(c));
+    const looksLikeVariance = cells.some(c => c.includes('missing')) && cells.some(c => c.includes('sold'));
+    const looksLikePurchase = cells.some(c => c.includes('bar code'));
+    return hasPourCost && !looksLikeVariance && !looksLikePurchase;
+  });
+}
+
+// Detailed Variance Report and Purchase Report headers, by their own
+// distinguishing columns — kept mutually exclusive with each other and
+// with findStocktakeHeaderIdx above (see its comment) so a given Sculpture
+// Hospitality export can only ever match exactly one of the three report
+// types, never two.
+function findVarianceHeaderIdx(rows) {
+  return rows.findIndex(r => {
+    if (String(r[0] || '').trim().toLowerCase() !== 'item name') return false;
+    const cells = r.map(c => String(c || '').toLowerCase());
+    return cells.some(c => c.includes('missing')) && cells.some(c => c.includes('sold'));
+  });
+}
+function findPurchaseHeaderIdx(rows) {
+  return rows.findIndex(r => {
+    if (String(r[0] || '').trim().toLowerCase() !== 'item name') return false;
+    const cells = r.map(c => String(c || '').toLowerCase());
+    return cells.some(c => c.includes('bar code'));
+  });
+}
+
+/* ── Purchase Report & Detailed Variance Report parsing (Sculpture
+   Hospitality) ────────────────────────────────────────────────────────────
+   Both are variable-depth grouped tables — unlike the Summary Accounting
+   Report's fixed 2-level Group>Category shape, the Purchase Report is
+   3-level (Group > Subcategory > Item, e.g. Liquor > GIN: > Archie Rose...)
+   while the Detailed Variance Report is 2-level with no enclosing Group at
+   all (just GIN: > Archie Rose... directly). parseSculptureGroupedRows
+   below reproduces whichever shape is actually present from one generic
+   stack-based tree walk, rather than two separate hand-written parsers.
+
+   A "does the rest of the row look blank" test alone is NOT enough to tell
+   a group/subcategory header apart from a genuine item row — real Harbord
+   Variance Report data has at least one item ("Corazon Extra Anejo Tequila
+   - 700ml") with zero stock movement all period, so every one of its figure
+   columns is blank too, which looks identical in shape to an empty group
+   header. The real, reliable signal is that every actual group/subcategory
+   header is eventually closed by its own "Total <name>:" row somewhere
+   below it, and a blank item never is — so this parser pre-scans for every
+   "Total X:" row's name first, and only treats a blank-rest row as opening
+   a new node when some later row actually closes it by that exact name. */
+function readSculptureFigures(r, columnKeys, parseFns) {
+  const figures = {};
+  columnKeys.forEach((key, idx) => { figures[key] = parseFns[idx](r[idx + 1]); });
+  return figures;
+}
+
+function parseSculptureGroupedRows(rows, headerIdx, columnKeys, parseFns) {
+  const totalNames = new Set();
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const m = /^total\s+(.+?):?\s*$/i.exec(String((rows[i] || [])[0] || '').trim());
+    if (m) totalNames.add(m[1].trim().toLowerCase());
+  }
+
+  const roots = [];
+  const stack = []; // open nodes, innermost last
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const label = String(r[0] || '').trim();
+    if (!label) continue;
+
+    const totalMatch = /^total\s+(.+?):?\s*$/i.exec(label);
+    if (totalMatch) {
+      const name = totalMatch[1].trim().toLowerCase();
+      for (let s = stack.length - 1; s >= 0; s--) {
+        if (stack[s].name.toLowerCase() === name) {
+          stack[s].subtotal = readSculptureFigures(r, columnKeys, parseFns);
+          stack.length = s; // closes this node, discarding anything nested-but-unclosed above it
+          break;
+        }
+      }
+      continue;
+    }
+
+    const restBlank = columnKeys.every((_, idx) => String(r[idx + 1] || '').trim() === '');
+    const name = label.replace(/:\s*$/, '').trim();
+    if (restBlank && totalNames.has(name.toLowerCase())) {
+      const node = { name, items: [], subtotal: null };
+      (stack.length ? stack[stack.length - 1].items : roots).push(node);
+      stack.push(node);
+      continue;
+    }
+
+    const item = { name: label, ...readSculptureFigures(r, columnKeys, parseFns) };
+    (stack.length ? stack[stack.length - 1].items : roots).push(item);
+  }
+  return roots;
+}
+
+// Purchase Report's own period-label format — full month name, comma after
+// the day, explicit year on both ends ("September 1, 2026 to September 30,
+// 2026") — unlike the short format shared by the Summary Accounting Report
+// and the Detailed Variance Report ("Jun 9 to Jun 22 2026", one trailing
+// year for both ends, parsed by parseStocktakePeriod above). Re-slices each
+// month word to its first 3 letters so it can reuse STOCKTAKE_MONTH_ABBR
+// rather than needing a second month-name table.
+function parseSculptureLongPeriod(label) {
+  const m = String(label || '').trim()
+    .match(/^([A-Za-z]{3,9})\s+(\d{1,2}),\s+(\d{4})\s+to\s+([A-Za-z]{3,9})\s+(\d{1,2}),\s+(\d{4})$/i);
+  if (!m) return null;
+  const fromMo = STOCKTAKE_MONTH_ABBR[m[1].slice(0, 3).toLowerCase()];
+  const toMo = STOCKTAKE_MONTH_ABBR[m[4].slice(0, 3).toLowerCase()];
+  if (fromMo === undefined || toMo === undefined) return null;
+  const from = new Date(parseInt(m[3], 10), fromMo, parseInt(m[2], 10));
+  const to = new Date(parseInt(m[6], 10), toMo, parseInt(m[5], 10));
+  return (isNaN(from.getTime()) || isNaN(to.getTime())) ? null : { from, to };
+}
+
+// Tries both of Sculpture Hospitality's observed period-label formats, so
+// the venue/period scan below doesn't need to know which report type it's
+// looking at.
+function parseSculpturePeriod(label) {
+  return parseStocktakePeriod(label) || parseSculptureLongPeriod(label);
+}
+
+// Same venue/fortnight-scanning approach as buildStocktakeFromRows uses
+// (scanned for shape above the header row, since there's no Venue:/Store:
+// label to anchor on) — factored out so both new report types share it
+// without copying buildStocktakeFromRows's own proven, already-tested
+// logic.
+function extractVenueAndPeriod(rows, headerIdx, periodParseFn) {
+  let venue = null, period = null;
+  for (let r = 0; r < headerIdx; r++) {
+    for (const raw of (rows[r] || [])) {
+      const cell = String(raw || '').trim();
+      if (!cell) continue;
+      const p = periodParseFn(cell);
+      if (p) period = p;
+      else if (!venue) venue = cell;
+    }
+  }
+  return (venue && period) ? { venue, period } : null;
+}
+
+// Purchase Report columns, confirmed against the real Harbord Hotel file:
+// Item Name | Bar code | Item Size | Unit Cost | Purchases | Purchase
+// Volume | Purchases (cost). barCode/itemSize/purchases/purchaseVolume are
+// kept as raw strings, not parsed to numbers — units mix ml/L/CASE/BTL/each
+// across categories (e.g. "6 x 700 ml", "1 CASE", "4200 ml"), so they are
+// not meaningfully summable and are shown as-is rather than coerced.
+const PURCHASE_REPORT_COLUMNS = ['barCode', 'itemSize', 'unitCost', 'purchases', 'purchaseVolume', 'purchasesCost'];
+const PURCHASE_REPORT_PARSE_FNS = [
+  v => String(v || '').trim() || null,
+  v => String(v || '').trim() || null,
+  stocktakeMoney,
+  v => String(v || '').trim() || null,
+  v => String(v || '').trim() || null,
+  stocktakeMoney,
+];
+
+function buildPurchaseReportFromRows(rows, headerIdx) {
+  const vp = extractVenueAndPeriod(rows, headerIdx, parseSculpturePeriod);
+  if (!vp) return null; // doesn't look like a usable Purchase Report
+  const groups = parseSculptureGroupedRows(rows, headerIdx, PURCHASE_REPORT_COLUMNS, PURCHASE_REPORT_PARSE_FNS);
+  if (!groups.length) return null;
+  return { venue: vp.venue, periodStart: vp.period.from, periodEnd: vp.period.to, groups };
+}
+
+function detectPurchaseReportSheet(workbook) {
+  if (!workbook) return null;
+  for (const sheetName of workbook.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: '', raw: false });
+    const headerIdx = findPurchaseHeaderIdx(rows);
+    if (headerIdx >= 0) return { rows, headerIdx };
+  }
+  return null;
+}
+
+function parsePurchaseReportFile(workbook) {
+  const sheet = detectPurchaseReportSheet(workbook);
+  if (!sheet) return null;
+  return buildPurchaseReportFromRows(sheet.rows, sheet.headerIdx);
+}
+
+// Detailed Variance Report columns, confirmed against the real Harbord
+// Hotel file: Item Name | Previous On-Hand | Purchases | On-Hand | Used |
+// Sold | Missing | % Missing | Missing (cost) | Used (cost) | Revenue |
+// Pour Cost | Spillage | Spillage (cost) | % Spillage. All 14 are numeric
+// (ml/ea quantities, $ amounts, or %), including signed values like
+// "+$0.80" / "-2" / "+51.9%" — stocktakeMoney/stocktakePct already parse
+// those correctly via parseFloat. Missing = Sold − Used: negative means
+// shrinkage/loss (used more than sold — theft, spillage, uncharged comps),
+// positive means oversold vs physical usage (unusual — a POS/SKU mapping
+// issue, a recipe multiplier, or a count-timing mismatch).
+const VARIANCE_REPORT_COLUMNS = [
+  'prevOnHand', 'purchases', 'onHand', 'used', 'sold', 'missing', 'missingPct',
+  'missingCost', 'usedCost', 'revenue', 'pourCostPct', 'spillage', 'spillageCost', 'spillagePct',
+];
+const VARIANCE_REPORT_PARSE_FNS = [
+  stocktakeMoney, stocktakeMoney, stocktakeMoney, stocktakeMoney, stocktakeMoney, stocktakeMoney, stocktakePct,
+  stocktakeMoney, stocktakeMoney, stocktakeMoney, stocktakePct, stocktakeMoney, stocktakeMoney, stocktakePct,
+];
+
+function buildVarianceReportFromRows(rows, headerIdx) {
+  const vp = extractVenueAndPeriod(rows, headerIdx, parseSculpturePeriod);
+  if (!vp) return null; // doesn't look like a usable Detailed Variance Report
+  const subcategories = parseSculptureGroupedRows(rows, headerIdx, VARIANCE_REPORT_COLUMNS, VARIANCE_REPORT_PARSE_FNS);
+  if (!subcategories.length) return null;
+  return { venue: vp.venue, periodStart: vp.period.from, periodEnd: vp.period.to, subcategories };
+}
+
+function detectVarianceReportSheet(workbook) {
+  if (!workbook) return null;
+  for (const sheetName of workbook.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: '', raw: false });
+    const headerIdx = findVarianceHeaderIdx(rows);
+    if (headerIdx >= 0) return { rows, headerIdx };
+  }
+  return null;
+}
+
+function parseVarianceReportFile(workbook) {
+  const sheet = detectVarianceReportSheet(workbook);
+  if (!sheet) return null;
+  return buildVarianceReportFromRows(sheet.rows, sheet.headerIdx);
 }
 
 function detectStocktakeSheet(workbook) {
@@ -1039,6 +1265,51 @@ async function parseStocktakeFileFallback(buf) {
     return buildStocktakeFromRows(rows, headerIdx);
   } catch (e) {
     return null; // never let a fallback-parsing bug break the main ingestion loop
+  }
+}
+
+// Shared by the Purchase Report and Detailed Variance Report fallback
+// parsers below — the same raw-ZIP read as parseStocktakeFileFallback above
+// (same <si > sharedStrings bug, confirmed present in both of these report
+// types too — see that function's comment for the full root-cause
+// writeup), stopping once it has a rows grid rather than also picking the
+// header row, since that part differs per report type.
+async function sculptureRowsFromRawBytes(buf) {
+  if (!buf || typeof DecompressionStream === 'undefined') return null;
+  const bytes = new Uint8Array(buf);
+  const entries = readZipEntries(bytes);
+  if (!entries) return null;
+  const sheetEntry = entries.find(e => /^xl\/worksheets\/sheet\d+\.xml$/i.test(e.name));
+  if (!sheetEntry) return null;
+  const sstEntry = entries.find(e => e.name === 'xl/sharedStrings.xml');
+  const sheetXml = await extractZipEntryText(bytes, sheetEntry);
+  if (!sheetXml) return null;
+  const sstXml = sstEntry ? await extractZipEntryText(bytes, sstEntry) : '';
+  const sharedStrings = sstXml ? parseSharedStringsXMLFallback(sstXml) : [];
+  return parseSheetRowsXMLFallback(sheetXml, sharedStrings);
+}
+
+async function parsePurchaseReportFileFallback(buf) {
+  try {
+    const rows = await sculptureRowsFromRawBytes(buf);
+    if (!rows) return null;
+    const headerIdx = findPurchaseHeaderIdx(rows);
+    if (headerIdx < 0) return null;
+    return buildPurchaseReportFromRows(rows, headerIdx);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function parseVarianceReportFileFallback(buf) {
+  try {
+    const rows = await sculptureRowsFromRawBytes(buf);
+    if (!rows) return null;
+    const headerIdx = findVarianceHeaderIdx(rows);
+    if (headerIdx < 0) return null;
+    return buildVarianceReportFromRows(rows, headerIdx);
+  } catch (e) {
+    return null;
   }
 }
 
@@ -1934,6 +2205,115 @@ function stocktakeHTML(stocktakeByPeriod) {
   </div>`;
 }
 
+/* ── Purchase Report & Detailed Variance Report rendering (Sculpture
+   Hospitality) ────────────────────────────────────────────────────────────
+   Purchase Report: total beverage spend by top-level group (Liquor, Wine,
+   Champagne, Kegs, Beer, RTD's/Cider/Packaged Wine, Miscellaneous), trended
+   across every period uploaded. Detailed Variance Report: physical
+   shrinkage/overage at the item level — Missing (cost) = Sold − Used in
+   dollar terms (see VARIANCE_REPORT_COLUMNS's comment for the sign
+   convention: negative is stock loss, positive is an oversold anomaly).
+   Rendered together since PC asked to build both reports as one combined
+   feature. */
+function sculptureQty(n) { return (n === null || n === undefined) ? '—' : Math.round(n).toLocaleString('en-AU'); }
+
+function purchaseReportHTML(purchaseByPeriod) {
+  const periods = Object.values(purchaseByPeriod || {})
+    .filter(p => p.groups && p.groups.length)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  if (!periods.length) return '';
+
+  const latest = periods[periods.length - 1];
+  const latestGroups = latest.groups.filter(g => g.subtotal && g.subtotal.purchasesCost != null)
+    .slice().sort((a, b) => b.subtotal.purchasesCost - a.subtotal.purchasesCost);
+  if (!latestGroups.length) return '';
+  const totalSpend = latestGroups.reduce((s, g) => s + g.subtotal.purchasesCost, 0);
+  const maxSpend = Math.max(...latestGroups.map(g => g.subtotal.purchasesCost));
+
+  const barsHTML = latestGroups.map(g => {
+    const amt = g.subtotal.purchasesCost;
+    const w = maxSpend > 0 ? Math.round(amt / maxSpend * 100) : 0;
+    const tc = w > 32 ? 'white' : 'var(--ink-mid)';
+    return `<div class="dow-row">
+      <span class="dow-label stocktake-label">${g.name}</span>
+      <div class="dow-track">
+        <div class="dow-fill" style="width:${w}%;background:#0F766E">
+          <span style="color:${tc}">${cur(amt)}</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  let trendFlag = '';
+  if (periods.length >= 2) {
+    const prev = periods[periods.length - 2];
+    const prevTotal = prev.groups.reduce((s, g) => s + (g.subtotal ? (g.subtotal.purchasesCost || 0) : 0), 0);
+    const delta = totalSpend - prevTotal;
+    const pct = prevTotal > 0 ? (delta / prevTotal * 100) : null;
+    if (pct !== null && Math.abs(pct) > 10) {
+      trendFlag = `<div class="flag ${delta > 0 ? 'warn' : 'good'}"><span class="flag-icon">${delta > 0 ? '↑' : '↓'}</span><span>Total beverage purchases ${delta > 0 ? 'rose' : 'fell'} ${Math.abs(pct).toFixed(0)}% vs the prior period uploaded (${cur(prevTotal)} → ${cur(totalSpend)})</span></div>`;
+    }
+  }
+
+  return `<div class="result-card">
+    <div class="card-label">Beverage purchases — spend by group${periods.length > 1 ? ` <span class="powered-by">${periods.length} periods uploaded</span>` : ''}</div>
+    <div class="metric-value">${cur(totalSpend)}</div>
+    <div class="metric-sub">Total beverage purchases for ${stocktakePeriodLabel(latest)}</div>
+    <div>${barsHTML}</div>
+    ${trendFlag}
+  </div>`;
+}
+
+function varianceReportHTML(varianceByPeriod) {
+  const periods = Object.values(varianceByPeriod || {})
+    .filter(p => p.subcategories && p.subcategories.length)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  if (!periods.length) return '';
+
+  const latest = periods[periods.length - 1];
+  const allItems = latest.subcategories.flatMap(s => s.items.map(i => ({ ...i, subcategory: s.name })))
+    .filter(i => i.missingCost != null && i.missingCost !== 0);
+  if (!allItems.length) return '';
+  const ranked = allItems.slice().sort((a, b) => Math.abs(b.missingCost) - Math.abs(a.missingCost)).slice(0, 12);
+
+  const totalLoss = allItems.filter(i => i.missingCost < 0).reduce((s, i) => s + i.missingCost, 0);
+  const totalOversold = allItems.filter(i => i.missingCost > 0).reduce((s, i) => s + i.missingCost, 0);
+
+  const tableRows = ranked.map(i => `
+    <tr>
+      <td>${i.name}</td>
+      <td>${i.subcategory}</td>
+      <td class="num">${sculptureQty(i.used)}</td>
+      <td class="num">${sculptureQty(i.sold)}</td>
+      <td class="num" style="color:${i.missingCost < 0 ? '#DC2626' : '#D97706'}">${i.missingCost < 0 ? '−' : '+'}${cur(Math.abs(i.missingCost))}</td>
+    </tr>`).join('');
+
+  // Loss = used more than sold (theft, spillage, uncharged comps). Oversold
+  // = sold more than was physically used — an anomaly, not a "good"
+  // outcome, since it usually means a POS/SKU mapping issue, a recipe
+  // multiplier, or a count-timing mismatch rather than genuinely efficient
+  // pours (see VARIANCE_REPORT_COLUMNS's comment).
+  const flags = [];
+  const worstLoss = allItems.filter(i => i.missingCost < 0).sort((a, b) => a.missingCost - b.missingCost).slice(0, 3);
+  if (worstLoss.length) {
+    flags.push(`<div class="flag warn"><span class="flag-icon">⚠</span><span>Biggest physical stock loss this fortnight: ${worstLoss.map(i => `<strong>${i.name}</strong> (${cur(Math.abs(i.missingCost))})`).join(', ')} — used more than was sold, worth checking for spillage, uncharged comps or theft</span></div>`);
+  }
+  const worstOversold = allItems.filter(i => i.missingCost > 0).sort((a, b) => b.missingCost - a.missingCost).slice(0, 3);
+  if (worstOversold.length) {
+    flags.push(`<div class="flag warn"><span class="flag-icon">⚠</span><span>Sold more than was physically used: ${worstOversold.map(i => `<strong>${i.name}</strong> (+${cur(i.missingCost)})`).join(', ')} — worth checking POS/SKU mapping, recipe multipliers, or count timing</span></div>`);
+  }
+
+  return `<div class="result-card">
+    <div class="card-label">Beverage variance — biggest misses, fortnight of ${stocktakePeriodLabel(latest)}</div>
+    <div class="metric-sub">${cur(Math.abs(totalLoss))} in physical stock loss · ${cur(totalOversold)} sold above physical usage, across ${allItems.length} line${allItems.length === 1 ? '' : 's'} with a variance</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>Item</th><th>Subcategory</th><th class="num">Used (ml)</th><th class="num">Sold (ml)</th><th class="num">Missing (cost)</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>
+    ${flags.join('')}
+  </div>`;
+}
+
 /* ── Daily Period Summary rendering ──────────────────────────────────────── */
 // A till variance under $5 is normal float/rounding noise, not worth
 // flagging — only genuine short/over discrepancies surface as a warning.
@@ -2112,7 +2492,7 @@ function discountBreakdownHTML(storeEntry) {
 }
 
 /* ── Venue narrative prompt ──────────────────────────────────────────────── */
-function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary, rosterByName = {}, stocktakeByPeriod = {}) {
+function buildPrompt(venueName, primary, headlineLabel, categoryStats, subVenues, weekly, periodSummary, rosterByName = {}, stocktakeByPeriod = {}, purchaseByPeriod = {}, varianceByPeriod = {}) {
   const catLines = categoryStats.map(c =>
     `- ${CATEGORY_LABELS[c.key] || c.key}: total ${cur(c.stats.total)} over ${c.stats.days.length} days, daily avg ${cur(c.stats.avg)}`
   ).join('\n');
@@ -2293,10 +2673,49 @@ Hourly pattern is based on ${headlineLabel}:
       cats.slice(0, 10).map(c => `- ${c.name} (${c.group}): ${cur(c.used)} used on ${cur(c.revenue)} revenue, ${c.pourCostPct.toFixed(1)}% pour cost`).join('\n');
   }
 
-  return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && (weeklySection || periodSummarySection || stocktakeSection) ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
-${dailySection}${weeklySection}${periodSummarySection}${stocktakeSection}
+  // Purchase Report — beverage spend by group, latest period uploaded, so
+  // the narrative can speak to where the money's actually going (not just
+  // pour cost %, which is a ratio and says nothing about absolute spend).
+  let purchaseSection = '';
+  const purchasePeriods = Object.values(purchaseByPeriod || {})
+    .filter(p => p.groups && p.groups.length)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  if (purchasePeriods.length) {
+    const latest = purchasePeriods[purchasePeriods.length - 1];
+    const groupLines = latest.groups.filter(g => g.subtotal && g.subtotal.purchasesCost != null)
+      .sort((a, b) => b.subtotal.purchasesCost - a.subtotal.purchasesCost)
+      .map(g => `- ${g.name}: ${cur(g.subtotal.purchasesCost)}`).join('\n');
+    purchaseSection = `\n\nBeverage purchases (Sculpture Hospitality Purchase Report), ${stocktakePeriodLabel(latest)}, by group:\n${groupLines}`;
+  }
 
-Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), which departments are getting the most/least revenue per labour hour and whether rostering matches demand, category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, which discount reasons are giving away the most margin and whether that looks justified, which beverage categories are running an unusually high physical pour cost vs this venue's own average and whether that's worth a wastage/pour-size/pricing check, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
+  // Detailed Variance Report — physical shrinkage/overage at the item
+  // level. Missing (cost) = Sold − Used in dollars: negative is stock loss
+  // (used more than sold — spillage, uncharged comps, theft), positive is
+  // an oversold anomaly (sold more than was physically used — usually a
+  // POS/SKU mapping issue, a recipe multiplier, or a count-timing
+  // mismatch, not genuine efficiency). Only the worst lines each way go
+  // into the prompt, same >0 floor as the rendered card.
+  let varianceSection = '';
+  const variancePeriods = Object.values(varianceByPeriod || {})
+    .filter(p => p.subcategories && p.subcategories.length)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  if (variancePeriods.length) {
+    const latest = variancePeriods[variancePeriods.length - 1];
+    const allItems = latest.subcategories.flatMap(s => s.items.map(i => ({ ...i, subcategory: s.name })))
+      .filter(i => i.missingCost != null && i.missingCost !== 0);
+    const worstLoss = allItems.filter(i => i.missingCost < 0).sort((a, b) => a.missingCost - b.missingCost).slice(0, 6);
+    const worstOversold = allItems.filter(i => i.missingCost > 0).sort((a, b) => b.missingCost - a.missingCost).slice(0, 4);
+    if (worstLoss.length || worstOversold.length) {
+      varianceSection = `\n\nBeverage variance (Sculpture Hospitality Detailed Variance Report — physical stock count, "Missing (cost)" = Sold − Used in dollars), ${stocktakePeriodLabel(latest)}:` +
+        (worstLoss.length ? `\nBiggest physical stock losses (used more than sold):\n${worstLoss.map(i => `- ${i.name} (${i.subcategory}): ${cur(Math.abs(i.missingCost))} loss`).join('\n')}` : '') +
+        (worstOversold.length ? `\nSold more than was physically used (possible POS/SKU/recipe mapping issue, not necessarily a good thing):\n${worstOversold.map(i => `- ${i.name} (${i.subcategory}): +${cur(i.missingCost)} oversold`).join('\n')}` : '');
+    }
+  }
+
+  return `You are a hospitality operations consultant writing an analysis for ${venueName}. Write ${primary && (weeklySection || periodSummarySection || stocktakeSection || purchaseSection || varianceSection) ? '4-5' : '3-4'} direct paragraphs — no bullet points, no headers. Be specific with figures. This venue's POS reports revenue in separate categories that should NOT be added into one combined "total revenue" figure — do not invent or state a single grand total. Surface patterns a busy owner or manager might not notice themselves.
+${dailySection}${weeklySection}${periodSummarySection}${stocktakeSection}${purchaseSection}${varianceSection}
+
+Cover whichever of the following the data supports: what the hourly pattern reveals about staffing opportunities, which day-of-week patterns are structurally strong or weak and why, what the best vs worst days suggest about demand drivers, standout staff performance (high or low margin), which departments are getting the most/least revenue per labour hour and whether rostering matches demand, category or product margin issues worth a pricing review, daily margin or till-variance issues worth flagging, which discount reasons are giving away the most margin and whether that looks justified, which beverage categories are running an unusually high physical pour cost vs this venue's own average and whether that's worth a wastage/pour-size/pricing check, which beverage groups are taking up the most purchase spend and whether that matches where the revenue actually comes from, which specific items show the biggest physical stock loss or an oversold anomaly and what that's worth checking, and 2 specific operational recommendations. Reference the category breakdown where relevant instead of a combined total.`;
 }
 
 async function streamBrief(prompt, targetEl) {
@@ -2369,7 +2788,7 @@ async function streamBrief(prompt, targetEl) {
    idempotent key for that kind of record — see collectAllRecords/
    applyRecord below for exactly how each report type maps onto it. */
 function newVenueBucket() {
-  return { categories: {}, subVenues: {}, weekly: { staffSales: {}, cogs: {}, productMix: {}, stockLoss: {}, tableWriteoffs: {}, bulkBeer: {} }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {} };
+  return { categories: {}, subVenues: {}, weekly: { staffSales: {}, cogs: {}, productMix: {}, stockLoss: {}, tableWriteoffs: {}, bulkBeer: {} }, periodSummary: {}, periodSummaryCount: 0, unsupportedWeeklyCount: 0, stocktake: {}, purchaseReports: {}, varianceReports: {} };
 }
 
 // field name on v.weekly  ->  persisted bucket name. productMix is handled
@@ -2444,6 +2863,14 @@ function applyRecord(venues, rosterByName, rec) {
     v.stocktake[rec.k1] = rec.data;
     return;
   }
+  if (rec.bucket === 'purchase_report') {
+    v.purchaseReports[rec.k1] = rec.data;
+    return;
+  }
+  if (rec.bucket === 'variance_report') {
+    v.varianceReports[rec.k1] = rec.data;
+    return;
+  }
   const weeklyField = WEEKLY_BUCKETS.find(([, bucket]) => bucket === rec.bucket);
   if (weeklyField) {
     v.weekly[weeklyField[0]][rec.k1] = rec.data;
@@ -2502,6 +2929,12 @@ function collectAllRecords(venues, rosterByName) {
     Object.entries(v.stocktake).forEach(([periodId, entry]) => {
       records.push({ venue: venueName, bucket: 'stocktake', k1: periodId, k2: '', data: entry });
     });
+    Object.entries(v.purchaseReports).forEach(([periodId, entry]) => {
+      records.push({ venue: venueName, bucket: 'purchase_report', k1: periodId, k2: '', data: entry });
+    });
+    Object.entries(v.varianceReports).forEach(([periodId, entry]) => {
+      records.push({ venue: venueName, bucket: 'variance_report', k1: periodId, k2: '', data: entry });
+    });
   });
   const rosterFlat = Object.values(rosterByName).flat();
   if (rosterFlat.length) {
@@ -2550,6 +2983,8 @@ async function runAnalysis() {
   let rosterFilesParsed = 0;
   let rosterResetDone = false;
   let stocktakeFilesParsed = 0;
+  let purchaseReportFilesParsed = 0;
+  let varianceReportFilesParsed = 0;
 
   setProgress(2, 'Loading saved history...', '');
   try {
@@ -2629,6 +3064,38 @@ async function runAnalysis() {
         const periodId = `${dateKey(stocktake.periodStart)}_${dateKey(stocktake.periodEnd)}`;
         venues[vKey].stocktake[periodId] = stocktake;
         stocktakeFilesParsed++;
+        parsed++;
+        continue;
+      }
+    }
+
+    // Sculpture Hospitality's Purchase Report and Detailed Variance Report
+    // — same no-Venue:/Store:-field situation as the stocktake Summary
+    // Accounting Report just above, and the same stray-space-<si> fallback
+    // need. The three Sculpture header detectors (findStocktakeHeaderIdx/
+    // findVarianceHeaderIdx/findPurchaseHeaderIdx) are mutually exclusive by
+    // construction, so trying all three here is safe — a given file can
+    // only ever match one.
+    if (xlsxWorkbook) {
+      let purchaseReport = parsePurchaseReportFile(xlsxWorkbook);
+      if (!purchaseReport && xlsxBuf) purchaseReport = await parsePurchaseReportFileFallback(xlsxBuf);
+      if (purchaseReport) {
+        const vKey = resolveVenueKey(venues, purchaseReport.venue);
+        venues[vKey] = venues[vKey] || newVenueBucket();
+        const periodId = `${dateKey(purchaseReport.periodStart)}_${dateKey(purchaseReport.periodEnd)}`;
+        venues[vKey].purchaseReports[periodId] = purchaseReport;
+        purchaseReportFilesParsed++;
+        parsed++;
+        continue;
+      }
+      let varianceReport = parseVarianceReportFile(xlsxWorkbook);
+      if (!varianceReport && xlsxBuf) varianceReport = await parseVarianceReportFileFallback(xlsxBuf);
+      if (varianceReport) {
+        const vKey = resolveVenueKey(venues, varianceReport.venue);
+        venues[vKey] = venues[vKey] || newVenueBucket();
+        const periodId = `${dateKey(varianceReport.periodStart)}_${dateKey(varianceReport.periodEnd)}`;
+        venues[vKey].varianceReports[periodId] = varianceReport;
+        varianceReportFilesParsed++;
         parsed++;
         continue;
       }
@@ -2882,6 +3349,8 @@ async function runAnalysis() {
     const hasWeekly = v.weekly.staffSales.length || v.weekly.cogs.length || productMixStores.length
       || v.weekly.stockLoss.length || v.weekly.tableWriteoffs.length || v.weekly.bulkBeer.length;
     const hasStocktake = Object.keys(v.stocktake || {}).length > 0;
+    const hasPurchaseReports = Object.keys(v.purchaseReports || {}).length > 0;
+    const hasVarianceReports = Object.keys(v.varianceReports || {}).length > 0;
 
     const metricsHTML = catStats.length ? catStats.map(c => `
       <div class="metric-card">
@@ -2956,6 +3425,8 @@ async function runAnalysis() {
       .join('');
 
     const stocktakeSection = hasStocktake ? stocktakeHTML(v.stocktake) : '';
+    const purchaseReportSection = hasPurchaseReports ? purchaseReportHTML(v.purchaseReports) : '';
+    const varianceReportSection = hasVarianceReports ? varianceReportHTML(v.varianceReports) : '';
 
     const availableMonths = getAvailableMonths(v);
     const monthlyTriggerHTML = availableMonths.length ? `
@@ -2981,6 +3452,8 @@ async function runAnalysis() {
       ${weeklySection}
       ${periodSummarySection}
       ${stocktakeSection}
+      ${purchaseReportSection}
+      ${varianceReportSection}
       <div class="result-card brief-card">
         <div class="card-label">
           <span>AI ops narrative</span>
@@ -3018,8 +3491,8 @@ async function runAnalysis() {
       });
     }
 
-    if (primary || hasWeekly || hasPeriodSummary || hasStocktake) {
-      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary, rosterByName, v.stocktake);
+    if (primary || hasWeekly || hasPeriodSummary || hasStocktake || hasPurchaseReports || hasVarianceReports) {
+      const prompt = buildPrompt(venueName, primary, primary ? (CATEGORY_LABELS[primary.key] || primary.key) : null, catStats, subVenueList, v.weekly, v.periodSummary, rosterByName, v.stocktake, v.purchaseReports, v.varianceReports);
       briefTargets.push({ prompt, el: section.querySelector(`#brief-${vslug}`) });
     } else {
       section.querySelector(`#brief-${vslug}`).textContent = 'Not enough category data for a narrative on this venue.';
